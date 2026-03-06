@@ -10,6 +10,7 @@ import torch.nn as nn
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 from dataclasses import dataclass
+from tqdm import tqdm
 
 # 确保模块路径正确
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -25,6 +26,7 @@ class GraphRAGConfig:
     original_data_path: str
     entities_path: str
     relations_path: str
+    bert_model_path: str = "bert-base-uncased"  # BERT模型路径（本地或HuggingFace）
     hidden_dim: int = 768
     num_query_layers: int = 3
     num_retriever_layers: int = 2
@@ -148,6 +150,7 @@ class GraphRAGPipeline(nn.Module):
             hidden_dim=config.hidden_dim,
             num_gnn_layers=config.num_query_layers,
             num_relations=config.num_relations,
+            bert_model_name=config.bert_model_path,  # 使用配置的BERT路径
             use_query_centered_pooling=True,
             use_bfs_gnn=True
         ).to(self.device)
@@ -224,6 +227,8 @@ def parse_args():
     parser.add_argument("--original_data_path", type=str, required=True, help="原始数据路径")
     parser.add_argument("--entities_path", type=str, required=True, help="实体列表路径")
     parser.add_argument("--relations_path", type=str, required=True, help="关系列表路径")
+    parser.add_argument("--bert_model_path", type=str, default="bert-base-uncased",
+                        help="BERT模型路径 (本地路径或HuggingFace模型名, 默认: bert-base-uncased)")
     parser.add_argument("--hidden_dim", type=int, default=768, help="隐藏层维度")
     parser.add_argument("--num_query_layers", type=int, default=3, help="查询编码器层数")
     parser.add_argument("--num_retriever_layers", type=int, default=2, help="检索器层数")
@@ -251,6 +256,7 @@ def main():
         original_data_path=args.original_data_path,
         entities_path=args.entities_path,
         relations_path=args.relations_path,
+        bert_model_path=args.bert_model_path,
         hidden_dim=args.hidden_dim,
         num_query_layers=args.num_query_layers,
         num_retriever_layers=args.num_retriever_layers,
@@ -286,11 +292,10 @@ def main():
 
     num_samples = min(len(dataset), config.max_samples or len(dataset))
     print(f"\n处理 {num_samples} 个样本...")
+    print(f"BERT模型: {config.bert_model_path}")
 
     all_results = []
-    for i in range(num_samples):
-        if i % 10 == 0:
-            print(f"  {i+1}/{num_samples}")
+    for i in tqdm(range(num_samples), desc="处理进度", ncols=80):
         result = pipeline.process_sample(i)
         all_results.append(result)
 
