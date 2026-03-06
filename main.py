@@ -95,8 +95,6 @@ class SubgraphProcessor:
         self.relations = relations
         self.hidden_dim = hidden_dim
         self.device = device
-        # 建立实体名称到索引的映射
-        self.entity_name_to_idx = {name: idx for idx, name in enumerate(entities)}
 
     def build_subgraph(self, subgraph_data: Dict, entity_indices: List[int]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[int, int]]:
         """从原始数据构建PyG格式的子图
@@ -136,31 +134,6 @@ class SubgraphProcessor:
 
         # 返回原始实体索引到局部索引的映射（key是整数索引）
         return node_features, edge_index, edge_types, idx2local
-
-    def locate_topic_entities(self, triples: List[List[str]], entity_idx2local: Dict[int, int]) -> List[int]:
-        """将图查询中的话题实体定位到子图上
-
-        Args:
-            triples: 图查询三元组，其中实体是名称（字符串）
-            entity_idx2local: 原始实体索引到局部索引的映射
-
-        Returns:
-            话题实体在子图中的局部索引列表
-        """
-        # 从triples中提取实体名称，转换为entities.txt中的索引
-        topic_entity_indices = set()
-        for head, rel, tail in triples:
-            if head != "?":
-                idx = self.entity_name_to_idx.get(head)
-                if idx is not None:
-                    topic_entity_indices.add(idx)
-            if tail != "?":
-                idx = self.entity_name_to_idx.get(tail)
-                if idx is not None:
-                    topic_entity_indices.add(idx)
-
-        # 将原始索引映射到子图中的局部索引
-        return [entity_idx2local[idx] for idx in topic_entity_indices if idx in entity_idx2local]
 
 
 class GraphRAGPipeline(nn.Module):
@@ -213,22 +186,24 @@ class GraphRAGPipeline(nn.Module):
             query_embedding = query_result[1] if isinstance(query_result, tuple) else query_result
 
         node_features, edge_index, edge_types, entity_idx2local = self.subgraph_processor.build_subgraph(subgraph_data, sample['entities'])
-        topic_entities = self.subgraph_processor.locate_topic_entities(triples, entity_idx2local)
+
+        # 使用原始数据中的entities字段作为话题实体（这些是entities.txt中的索引）
+        topic_entity_indices = sample['entities']  # 从原始数据获取
+        # 将这些索引映射到子图的局部索引
+        topic_entities = [entity_idx2local[idx] for idx in topic_entity_indices if idx in entity_idx2local]
 
         if len(topic_entities) == 0:
             return {"id": sample['id'], "question": question, "error": "No topic entities found"}
 
         self.retriever.eval()
         with torch.no_grad():
-            # 将局部索引映射回实体名称（用于调试输出）
-            local2entity = {v: self.subgraph_processor.entities[k] for k, v in entity_idx2local.items()}
             result = self.retriever(
                 topic_entities=topic_entities,
                 node_features=node_features,
                 edge_index=edge_index,
                 edge_types=edge_types,
                 query_embedding=query_embedding,
-                entity_names=[local2entity.get(i, f"entity_{i}") for i in range(len(entity_idx2local))],
+                entity_names=[f"entity_{i}" for i in range(len(entity_idx2local))],
                 top_k=self.config.top_k
             )
 
