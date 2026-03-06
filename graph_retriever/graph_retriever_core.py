@@ -82,7 +82,7 @@ class PathEncoder(nn.Module):
         path_node_feats = node_features[path_nodes]  # (path_len, hidden_dim)
 
         # 获取关系特征
-        rel_indices = torch.tensor(path_relations, device=node_features.device)
+        rel_indices = torch.tensor(path_relations, dtype=torch.long, device=node_features.device)
         path_rel_feats = self.relation_embedding(rel_indices)  # (path_len-1, hidden_dim)
 
         # 对于起始节点，使用零向量作为关系特征
