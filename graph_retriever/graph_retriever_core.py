@@ -400,8 +400,8 @@ class GraphRetriever(nn.Module):
 
             if similarity.item() >= self.similarity_threshold:
                 completed_paths.append(ReasoningPath(
-                    nodes=p_nodes,
-                    relations=p_relations,
+                    nodes=path_nodes,
+                    relations=path_relations,
                     score=score,
                     query_similarity=similarity.item()
                 ))
