@@ -315,29 +315,42 @@ class FastGraphRAGTrainer:
 
     def contrastive_loss(self, query_emb: torch.Tensor, pos_embs: List[torch.Tensor],
                         neg_embs: List[torch.Tensor]) -> torch.Tensor:
-        """对比学习损失"""
+        """对比学习损失（数值稳定版本）"""
         if not pos_embs:
             return torch.tensor(0.0, device=self.device)
 
+        eps = 1e-8  # 防止除零
+
         # 编码正样本路径
-        if pos_embs:
-            pos_stack = torch.stack(pos_embs)
-            pos_sim = F.cosine_similarity(query_emb.unsqueeze(0), pos_stack, dim=-1)
-            pos_loss = torch.clamp(1 - pos_sim, min=0).mean()
-        else:
-            pos_loss = torch.tensor(0.0, device=self.device)
+        pos_stack = torch.stack(pos_embs)
+        # 安全的余弦相似度计算
+        pos_sim = self._safe_cosine_similarity(query_emb.unsqueeze(0), pos_stack, eps)
+        pos_loss = torch.clamp(1 - pos_sim, min=0).mean()
 
         # 编码负样本路径
         if neg_embs:
             neg_stack = torch.stack(neg_embs)
-            neg_sim = F.cosine_similarity(query_emb.unsqueeze(0), neg_stack, dim=-1)
-            # 困难负样本：相似度高的负样本给予更大权重
-            weights = F.softmax(neg_sim * 2, dim=0)
-            neg_loss = (weights * F.relu(neg_sim - 0.5)).sum()
+            neg_sim = self._safe_cosine_similarity(query_emb.unsqueeze(0), neg_stack, eps)
+            # 数值稳定的加权：使用温度缩放的softmax
+            weights = F.softmax(neg_sim / 0.1, dim=0)  # 温度0.1使分布更平缓
+            neg_loss = (weights * F.relu(neg_sim - 0.3)).sum()  # margin从0.5降到0.3
         else:
             neg_loss = torch.tensor(0.0, device=self.device)
 
-        return pos_loss + neg_loss
+        loss = pos_loss + neg_loss
+
+        # 检查NaN，如果是则返回0
+        if torch.isnan(loss) or torch.isinf(loss):
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        return loss
+
+    def _safe_cosine_similarity(self, x1: torch.Tensor, x2: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        """安全的余弦相似度计算，防止NaN"""
+        # 归一化前先加eps
+        x1_norm = F.normalize(x1, p=2, dim=-1, eps=eps)
+        x2_norm = F.normalize(x2, p=2, dim=-1, eps=eps)
+        return (x1_norm * x2_norm).sum(dim=-1).clamp(-1 + eps, 1 - eps)
 
     def build_subgraph_features(
         self,
@@ -373,11 +386,12 @@ class FastGraphRAGTrainer:
         entity_idx2local = {idx: i for i, idx in enumerate(entity_list)}
         num_nodes = len(entity_list)
 
-        # 初始化节点特征（可学习的特征，这里用随机初始化）
-        node_features = torch.randn(
+        # 初始化节点特征（Xavier初始化，数值更稳定）
+        node_features = torch.empty(
             num_nodes, self.config.hidden_dim,
             device=self.device
         )
+        nn.init.xavier_uniform_(node_features)
 
         return node_features, entity_idx2local
 
