@@ -437,14 +437,17 @@ class FastGraphRAGTrainer:
             for path_nodes, path_rels in pos_paths:
                 # 转换节点索引为局部索引
                 local_nodes = [global_to_local(n) for n in path_nodes]
-                if -1 in local_nodes:
+                if -1 in local_nodes or len(local_nodes) == 0:
                     continue
+
+                # 关系索引取模，确保在范围内
+                local_rels = [r % self.config.num_relations for r in path_rels]
 
                 # 使用 path_encoder 编码路径
                 path_emb = self.model['path_encoder'](
                     node_features,
                     local_nodes,
-                    path_rels
+                    local_rels
                 )
                 pos_embs.append(path_emb)
 
@@ -452,13 +455,16 @@ class FastGraphRAGTrainer:
             neg_embs = []
             for path_nodes, path_rels in neg_paths:
                 local_nodes = [global_to_local(n) for n in path_nodes]
-                if -1 in local_nodes:
+                if -1 in local_nodes or len(local_nodes) == 0:
                     continue
+
+                # 关系索引取模，确保在范围内
+                local_rels = [r % self.config.num_relations for r in path_rels]
 
                 path_emb = self.model['path_encoder'](
                     node_features,
                     local_nodes,
-                    path_rels
+                    local_rels
                 )
                 neg_embs.append(path_emb)
 
