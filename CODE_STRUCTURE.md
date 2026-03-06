@@ -25,29 +25,17 @@
 - `graph_retriever_core.py` - 检索器核心实现
 - `data_loader.py` - CWQ数据加载器
 
-## 删除的非必要文件
-
-- `run_encoder.py` - 可用 `graph_query_encoder/main.py` 替代
-- `run_retriever.py` - 可用 `graph_retriever/main.py` 或根目录 `main.py` 替代
-- `CHANGES.md` - 变更日志
-- `USAGE.md` - 使用说明（内容合并到README.md）
-- `graph_query_encoder/example_usage.py` - 示例代码
-- `graph_query_encoder/retriever_example.py` - 示例代码
-- `graph_query_encoder/run_retriever.py` - 重复入口
-- `graph_query_encoder/config.py` - 配置文件（配置已移至main.py参数）
-- `graph_query_encoder/README.md` - 模块文档
-- `graph_retriever/example_usage.py` - 示例代码
-- `graph_retriever/README.md` - 模块文档
-
 ## 使用方式
 
 ### 1. 完整流程（推荐）
 ```bash
-python main.py \
-    --graph_query_path dataset/CWQ/CWQ/graph_query_dev.json \
-    --original_data_path dataset/CWQ/CWQ/dev_simple.json \
-    --entities_path dataset/CWQ/CWQ/entities.txt \
-    --relations_path dataset/CWQ/CWQ/relations.txt
+python SPARQ/main.py \
+    --graph_query_path /root/autodl-tmp/dataset/CWQ/graph_query/graph_query_dev.json \
+    --original_data_path /root/autodl-tmp/dataset/CWQ/CWQ/dev_simple.json \
+    --entities_path /root/autodl-tmp/dataset/CWQ/CWQ/entities.txt \
+    --relations_path /root/autodl-tmp/dataset/CWQ/CWQ/relations.txt \
+    --bert_model_path /root/autodl-tmp/bert-base-uncased \
+    --output_path output/results.json
 ```
 
 ### 2. ICL检索
@@ -56,11 +44,3 @@ from icl_retriever import ICLRetriever
 retriever = ICLRetriever("examples.json")
 results = retriever.retrieve("问题文本", entities=[...], top_k=3)
 ```
-
-## 代码简化说明
-
-- 删除了详细的docstring和注释
-- 删除了示例代码和测试代码
-- 删除了多余的命令行入口
-- 合并了重复的配置定义
-- 保留了核心算法实现

@@ -6,7 +6,7 @@
 import torch
 import torch.nn as nn
 from transformers import BertModel, BertTokenizer
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 
 class EmbeddingLayer(nn.Module):
@@ -125,7 +125,7 @@ class EmbeddingLayer(nn.Module):
         entities: List[str],
         relations: List[str],
         device: torch.device
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         前向传播
 

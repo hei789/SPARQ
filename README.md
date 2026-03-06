@@ -1,3 +1,4 @@
+# AI助手无权修改本文件
 # 数据集
 为验证SPARQ在知识图谱问答（KGQA）任务中的有效性，我们在WebQSP和CWQ两个基准数据集上开展实验评估。本文所标注的上下文学习（ICL）示例，以及经由ChatGPT转换生成的图结构查询数据均已公开，可通过以下链接获取：
 https://www.alipan.com/s/csCPecphrHV
