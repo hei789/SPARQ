@@ -90,11 +90,12 @@ class CWQDataset:
 class SubgraphProcessor:
     """子图处理器"""
 
-    def __init__(self, entities: List[str], relations: List[str], hidden_dim: int, device: torch.device):
+    def __init__(self, entities: List[str], relations: List[str], hidden_dim: int, device: torch.device, num_relations: int = 100):
         self.entities = entities
         self.relations = relations
         self.hidden_dim = hidden_dim
         self.device = device
+        self.num_relations = num_relations
 
     def build_subgraph(self, subgraph_data: Dict, entity_indices: List[int]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[int, int]]:
         """从原始数据构建PyG格式的子图
@@ -128,7 +129,8 @@ class SubgraphProcessor:
         for h, r, t in tuples:
             src, dst = idx2local[h], idx2local[t]
             if r not in relation2idx:
-                relation2idx[r] = next_rel_idx
+                # 关系索引取模，确保不超过 num_relations
+                relation2idx[r] = next_rel_idx % self.num_relations
                 next_rel_idx += 1
             edges.append([src, dst])
             edge_types.append(relation2idx[r])
@@ -171,7 +173,8 @@ class GraphRAGPipeline(nn.Module):
             entities=dataset.entities,
             relations=dataset.relations,
             hidden_dim=self.config.hidden_dim,
-            device=self.device
+            device=self.device,
+            num_relations=self.config.num_relations
         )
 
     def process_sample(self, idx: int) -> Dict[str, Any]:
