@@ -431,72 +431,61 @@ class FastGraphRAGTrainer:
         if node_features is None:
             return 0.0
 
-        # 编码查询（不使用AMP，避免GNN层类型不匹配）
-        query_result = self.model['query_encoder'](
-            sample['triples'],
-            return_all_node_features=True
-        )
-        if isinstance(query_result, tuple):
-            query_emb = query_result[1]
-        else:
-            query_emb = query_result
+        # 辅助函数：全局索引转局部索引
+        def global_to_local(global_idx):
+            return entity_idx2local.get(global_idx, -1)
 
-        # 如果启用AMP，将查询向量转为半精度以匹配路径向量
-        if self.config.use_amp:
-            query_emb = query_emb.half()
+        # 统一在float下编码，避免类型转换的内存开销
+        with torch.cuda.amp.autocast(enabled=False):  # 禁用AMP，使用全精度
+            # 编码查询
+            query_result = self.model['query_encoder'](
+                sample['triples'],
+                return_all_node_features=True
+            )
+            if isinstance(query_result, tuple):
+                query_emb = query_result[1]
+            else:
+                query_emb = query_result
 
-        with autocast(enabled=self.config.use_amp):
+            # 分批处理路径以节省显存
+            max_paths_per_batch = 10  # 每批最多处理10条路径
 
-            # 将全局实体索引转换为局部索引
-            def global_to_local(global_idx):
-                return entity_idx2local.get(global_idx, -1)
+            def encode_paths_batch(paths_list):
+                """分批编码路径，避免一次性存储所有向量"""
+                all_embs = []
+                for i in range(0, len(paths_list), max_paths_per_batch):
+                    batch_paths = paths_list[i:i + max_paths_per_batch]
+                    batch_embs = []
+                    for path_nodes, path_rels in batch_paths:
+                        local_nodes = [global_to_local(n) for n in path_nodes]
+                        if -1 in local_nodes or len(local_nodes) == 0:
+                            continue
+                        local_rels = [r % self.config.num_relations for r in path_rels]
+                        path_emb = self.model['path_encoder'](
+                            node_features, local_nodes, local_rels
+                        )
+                        batch_embs.append(path_emb)
+                    all_embs.extend(batch_embs)
+                    # 每处理完一批，清理缓存
+                    if len(batch_embs) >= max_paths_per_batch:
+                        torch.cuda.empty_cache()
+                return all_embs
 
             # 编码正样本路径
-            pos_embs = []
-            for path_nodes, path_rels in pos_paths:
-                # 转换节点索引为局部索引
-                local_nodes = [global_to_local(n) for n in path_nodes]
-                if -1 in local_nodes or len(local_nodes) == 0:
-                    continue
-
-                # 关系索引取模，确保在范围内
-                local_rels = [r % self.config.num_relations for r in path_rels]
-
-                # 使用 path_encoder 编码路径
-                path_emb = self.model['path_encoder'](
-                    node_features,
-                    local_nodes,
-                    local_rels
-                )
-                pos_embs.append(path_emb)
-
-            # 编码负样本路径
-            neg_embs = []
-            for path_nodes, path_rels in neg_paths:
-                local_nodes = [global_to_local(n) for n in path_nodes]
-                if -1 in local_nodes or len(local_nodes) == 0:
-                    continue
-
-                # 关系索引取模，确保在范围内
-                local_rels = [r % self.config.num_relations for r in path_rels]
-
-                path_emb = self.model['path_encoder'](
-                    node_features,
-                    local_nodes,
-                    local_rels
-                )
-                neg_embs.append(path_emb)
-
+            pos_embs = encode_paths_batch(pos_paths)
             if not pos_embs:
                 return 0.0
 
-            # 确保所有向量都是相同类型（AMP下为half）
-            if self.config.use_amp:
-                pos_embs = [emb.half() if emb.dtype != torch.float16 else emb for emb in pos_embs]
-                neg_embs = [emb.half() if emb.dtype != torch.float16 else emb for emb in neg_embs]
+            # 编码负样本路径
+            neg_embs = encode_paths_batch(neg_paths)
 
-            # 计算损失
+            # 计算损失（全精度，避免NaN）
             loss = self.contrastive_loss(query_emb, pos_embs, neg_embs)
+
+        # 清理中间变量释放显存
+        del node_features, pos_embs, neg_embs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return loss
 
