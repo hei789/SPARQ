@@ -278,12 +278,18 @@ class GraphRetriever(nn.Module):
         计算路径与查询的相似度
 
         Args:
-            path_embedding: 路径嵌入 (hidden_dim,)
+            path_embedding: 路径嵌入 (hidden_dim,) or (1, hidden_dim)
             query_embedding: 查询嵌入 (hidden_dim,)
 
         Returns:
             similarity: 相似度分数 (标量)
         """
+        # 确保两个张量都是1维
+        if path_embedding.dim() > 1:
+            path_embedding = path_embedding.squeeze(0)
+        if query_embedding.dim() > 1:
+            query_embedding = query_embedding.squeeze(0)
+
         combined = torch.cat([path_embedding, query_embedding], dim=-1)
         score = self.similarity_scorer(combined)
         return torch.sigmoid(score).squeeze()
