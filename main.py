@@ -113,6 +113,10 @@ class SubgraphProcessor:
             all_entity_indices.add(h)
             all_entity_indices.add(t)
 
+        # 确保话题实体（entity_indices）也被包含在子图中
+        for idx in entity_indices:
+            all_entity_indices.add(idx)
+
         entity_list = sorted(list(all_entity_indices))
         idx2local = {idx: i for i, idx in enumerate(entity_list)}
         num_nodes = len(entity_list)
@@ -191,6 +195,36 @@ class GraphRAGPipeline(nn.Module):
         topic_entity_indices = sample['entities']  # 从原始数据获取
         # 将这些索引映射到子图的局部索引
         topic_entities = [entity_idx2local[idx] for idx in topic_entity_indices if idx in entity_idx2local]
+
+        # 调试：检查索引范围
+        num_nodes = node_features.size(0)
+        # 检查 edge_index 范围
+        if edge_index.numel() > 0:
+            max_edge_idx = edge_index.max().item()
+            if max_edge_idx >= num_nodes:
+                return {
+                    "id": sample['id'],
+                    "question": question,
+                    "error": f"Edge index out of range: max_edge={max_edge_idx}, num_nodes={num_nodes}",
+                    "debug": {
+                        "edge_index_max": max_edge_idx,
+                        "num_nodes": num_nodes,
+                        "tuples_count": len(subgraph_data.get('tuples', []))
+                    }
+                }
+
+        if any(te >= num_nodes for te in topic_entities):
+            return {
+                "id": sample['id'],
+                "question": question,
+                "error": f"Topic entity index out of range: max_topic={max(topic_entities) if topic_entities else 'N/A'}, num_nodes={num_nodes}",
+                "debug": {
+                    "topic_entities": topic_entities,
+                    "num_nodes": num_nodes,
+                    "entity_idx2local": {k: v for k, v in list(entity_idx2local.items())[:5]},
+                    "sample_entities": sample['entities'][:5] if sample['entities'] else []
+                }
+            }
 
         if len(topic_entities) == 0:
             return {"id": sample['id'], "question": question, "error": "No topic entities found"}
