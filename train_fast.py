@@ -417,16 +417,21 @@ class FastGraphRAGTrainer:
         if node_features is None:
             return 0.0
 
+        # 编码查询（不使用AMP，避免GNN层类型不匹配）
+        query_result = self.model['query_encoder'](
+            sample['triples'],
+            return_all_node_features=True
+        )
+        if isinstance(query_result, tuple):
+            query_emb = query_result[1]
+        else:
+            query_emb = query_result
+
+        # 如果启用AMP，将查询向量转为半精度以匹配路径向量
+        if self.config.use_amp:
+            query_emb = query_emb.half()
+
         with autocast(enabled=self.config.use_amp):
-            # 编码查询
-            query_result = self.model['query_encoder'](
-                sample['triples'],
-                return_all_node_features=True
-            )
-            if isinstance(query_result, tuple):
-                query_emb = query_result[1]
-            else:
-                query_emb = query_result
 
             # 将全局实体索引转换为局部索引
             def global_to_local(global_idx):
@@ -470,6 +475,11 @@ class FastGraphRAGTrainer:
 
             if not pos_embs:
                 return 0.0
+
+            # 确保所有向量都是相同类型（AMP下为half）
+            if self.config.use_amp:
+                pos_embs = [emb.half() if emb.dtype != torch.float16 else emb for emb in pos_embs]
+                neg_embs = [emb.half() if emb.dtype != torch.float16 else emb for emb in neg_embs]
 
             # 计算损失
             loss = self.contrastive_loss(query_emb, pos_embs, neg_embs)
