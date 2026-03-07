@@ -282,6 +282,10 @@ class FastGraphRAGTrainer:
             'path_encoder': path_encoder
         })
 
+        # 冻结 path_encoder，只训练 query_encoder（节省显存）
+        for param in path_encoder.parameters():
+            param.requires_grad = False
+
         # 冻结BERT前几层（可选，加速训练）
         # for param in query_encoder.embedding_layer.bert.encoder.layer[:6].parameters():
         #     param.requires_grad = False
@@ -302,11 +306,11 @@ class FastGraphRAGTrainer:
         return model
 
     def _init_optimizer(self):
-        """初始化优化器"""
+        """初始化优化器（只训练 query_encoder）"""
         # 分层学习率
         param_groups = [
             {'params': self.model['query_encoder'].gnn.parameters(), 'lr': self.config.learning_rate},
-            {'params': self.model['path_encoder'].parameters(), 'lr': self.config.learning_rate},
+            # path_encoder 已冻结，不加入优化器
             {'params': self.model['query_encoder'].embedding_layer.parameters(), 'lr': self.config.bert_learning_rate},
         ]
 
@@ -435,23 +439,23 @@ class FastGraphRAGTrainer:
         def global_to_local(global_idx):
             return entity_idx2local.get(global_idx, -1)
 
-        # 统一在float下编码，避免类型转换的内存开销
-        with torch.cuda.amp.autocast(enabled=False):  # 禁用AMP，使用全精度
-            # 编码查询
-            query_result = self.model['query_encoder'](
-                sample['triples'],
-                return_all_node_features=True
-            )
-            if isinstance(query_result, tuple):
-                query_emb = query_result[1]
-            else:
-                query_emb = query_result
+        # 编码查询（需要梯度）
+        query_result = self.model['query_encoder'](
+            sample['triples'],
+            return_all_node_features=True
+        )
+        if isinstance(query_result, tuple):
+            query_emb = query_result[1]
+        else:
+            query_emb = query_result
 
-            # 分批处理路径以节省显存
-            max_paths_per_batch = 10  # 每批最多处理10条路径
+        # path_encoder 已冻结，使用 torch.no_grad() 节省显存
+        with torch.no_grad():
+            # 分批处理路径
+            max_paths_per_batch = 5
 
             def encode_paths_batch(paths_list):
-                """分批编码路径，避免一次性存储所有向量"""
+                """分批编码路径"""
                 all_embs = []
                 for i in range(0, len(paths_list), max_paths_per_batch):
                     batch_paths = paths_list[i:i + max_paths_per_batch]
@@ -466,24 +470,27 @@ class FastGraphRAGTrainer:
                         )
                         batch_embs.append(path_emb)
                     all_embs.extend(batch_embs)
-                    # 每处理完一批，清理缓存
-                    if len(batch_embs) >= max_paths_per_batch:
-                        torch.cuda.empty_cache()
                 return all_embs
 
             # 编码正样本路径
             pos_embs = encode_paths_batch(pos_paths)
             if not pos_embs:
+                del node_features
                 return 0.0
 
             # 编码负样本路径
             neg_embs = encode_paths_batch(neg_paths)
 
-            # 计算损失（全精度，避免NaN）
-            loss = self.contrastive_loss(query_emb, pos_embs, neg_embs)
+            # 清理node_features
+            del node_features
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # 计算损失（需要梯度）
+        loss = self.contrastive_loss(query_emb, pos_embs, neg_embs)
 
         # 清理中间变量释放显存
-        del node_features, pos_embs, neg_embs
+        del pos_embs, neg_embs, query_emb
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 

@@ -407,6 +407,268 @@ python SPARQ/train_fast.py \
     --cache_paths
 ```
 
+---
+
+## train_fast.py 详细训练方法
+
+### 1. 训练架构
+
+`train_fast.py` 采用**双塔对比学习架构**，训练时冻结路径编码器（path_encoder），仅训练查询编码器（query_encoder）：
+
+```
+┌─────────────────┐     ┌─────────────────┐
+│  Query Encoder  │     │  Path Encoder   │
+│  (trainable)    │     │  (frozen)       │
+│                 │     │                 │
+│  BERT + GNN     │     │  GNN Layers     │
+│  ↓              │     │  ↓              │
+│  query_emb      │◄────┤  path_emb       │
+│  (768-dim)      │相似度 │  (768-dim)      │
+└─────────────────┘     └─────────────────┘
+         │                       │
+         │         对比学习       │
+         └───────┬───────────────┘
+                 ▼
+           contrastive_loss
+```
+
+### 2. 正负样本路径采样
+
+#### 2.1 正样本路径采样
+
+正样本路径定义为：**从话题实体出发，通过BFS遍历能够到达答案实体的路径**。
+
+采样算法：
+```python
+def sample_positive_paths(topic_entities, answer_entities, subgraph, max_length=3):
+    positive_paths = []
+    for start in topic_entities:
+        # BFS遍历，深度限制为 max_length
+        for depth in range(max_path_length):
+            for node in current_queue:
+                for (next_node, relation) in adj_list[node]:
+                    if next_node in answer_set:
+                        # 找到答案实体，记录路径
+                        positive_paths.append((path_nodes, path_relations))
+    return positive_paths[:max_paths_per_sample]  # 限制每样本路径数
+```
+
+**参数说明：**
+| 参数 | 符号 | 默认值 | 说明 |
+|------|------|--------|------|
+| `max_path_length` | $L_{max}$ | 3 | 最大路径长度（跳数） |
+| `max_paths_per_sample` | $K_{pos}$ | 5 | 每样本最大正样本路径数 |
+
+#### 2.2 负样本路径采样
+
+负样本路径通过**随机游走**生成，确保终点不是答案实体：
+
+```python
+def sample_negative_paths(topic_entities, answer_entities, subgraph, num_negatives):
+    negative_paths = []
+    for _ in range(num_negatives):
+        start = random.choice(topic_entities)
+        path_nodes = [start]
+        path_rels = []
+
+        for step in range(random.randint(1, max_path_length)):
+            next_node, rel = random.choice(adj_list[current])
+            if next_node in path_nodes:  # 避免环路
+                break
+            path_nodes.append(next_node)
+            path_rels.append(rel)
+
+            # 确保不是答案实体且路径长度>=2
+            if current not in answer_set and len(path_nodes) >= 2:
+                negative_paths.append((path_nodes, path_rels))
+```
+
+**参数说明：**
+| 参数 | 符号 | 默认值 | 说明 |
+|------|------|--------|------|
+| `num_negatives` | $N_{neg}$ | 3 | 每个正样本对应的负样本数量 |
+
+### 3. 损失函数计算
+
+#### 3.1 余弦相似度计算
+
+查询表征与路径表征之间的相似度使用**余弦相似度**计算：
+
+$$\text{sim}(q, p) = \frac{q \cdot p}{\|q\|_2 \|p\|_2} = \frac{\sum_{i=1}^{d} q_i p_i}{\sqrt{\sum_{i=1}^{d} q_i^2} \cdot \sqrt{\sum_{i=1}^{d} p_i^2}}$$
+
+其中：
+- $q \in \mathbb{R}^{d}$：查询表征向量，$d = 768$
+- $p \in \mathbb{R}^{d}$：路径表征向量，$d = 768$
+- $\text{sim}(q, p) \in [-1, 1]$：相似度值
+
+**数值稳定版本**（防止除零）：
+```python
+def safe_cosine_similarity(x1, x2, eps=1e-8):
+    x1_norm = F.normalize(x1, p=2, dim=-1, eps=eps)
+    x2_norm = F.normalize(x2, p=2, dim=-1, eps=eps)
+    return (x1_norm * x2_norm).sum(dim=-1).clamp(-1 + eps, 1 - eps)
+```
+
+#### 3.2 对比学习损失（Contrastive Loss）
+
+总损失由**正样本损失**和**负样本损失**两部分组成：
+
+$$\mathcal{L} = \mathcal{L}_{pos} + \mathcal{L}_{neg}$$
+
+##### 正样本损失
+
+对于每个正样本路径 $p^+ \in \mathcal{P}^+$，希望其与查询的相似度接近1：
+
+$$\mathcal{L}_{pos} = \frac{1}{|\mathcal{P}^+|} \sum_{p^+ \in \mathcal{P}^+} \max(0, 1 - \text{sim}(q, p^+))$$
+
+其中：
+- $\mathcal{P}^+$：正样本路径集合
+- $|\mathcal{P}^+|$：正样本路径数量
+- $\max(0, 1 - \text{sim}(q, p^+))$：Hinge Loss，当相似度<1时产生惩罚
+
+##### 负样本损失
+
+对于负样本路径 $p^- \in \mathcal{P}^-$，采用**温度缩放的加权损失**：
+
+$$\mathcal{L}_{neg} = \sum_{p^- \in \mathcal{P}^-} w(p^-) \cdot \max(0, \text{sim}(q, p^-) - \tau)$$
+
+其中权重 $w(p^-)$ 通过softmax计算：
+
+$$w(p^-) = \frac{\exp(\text{sim}(q, p^-) / T)}{\sum_{p' \in \mathcal{P}^-} \exp(\text{sim}(q, p') / T)}$$
+
+**参数说明：**
+| 参数 | 符号 | 默认值 | 说明 |
+|------|------|--------|------|
+| `margin` | $\tau$ | 0.3 | 负样本边界阈值，相似度低于此值不惩罚 |
+| `temperature` | $T$ | 0.1 | 温度系数，控制softmax分布的平滑程度 |
+
+#### 3.3 完整损失函数代码
+
+```python
+def contrastive_loss(query_emb, pos_embs, neg_embs):
+    """
+    参数:
+        query_emb: (hidden_dim,) - 查询表征
+        pos_embs: List[(hidden_dim,)] - 正样本路径表征列表
+        neg_embs: List[(hidden_dim,)] - 负样本路径表征列表
+    返回:
+        loss: scalar - 对比学习损失值
+    """
+    eps = 1e-8
+
+    # 正样本损失
+    pos_stack = torch.stack(pos_embs)  # (num_pos, hidden_dim)
+    pos_sim = safe_cosine_similarity(query_emb.unsqueeze(0), pos_stack, eps)
+    pos_loss = torch.clamp(1 - pos_sim, min=0).mean()
+
+    # 负样本损失（加权）
+    if neg_embs:
+        neg_stack = torch.stack(neg_embs)  # (num_neg, hidden_dim)
+        neg_sim = safe_cosine_similarity(query_emb.unsqueeze(0), neg_stack, eps)
+        weights = F.softmax(neg_sim / 0.1, dim=0)  # 温度缩放
+        neg_loss = (weights * F.relu(neg_sim - 0.3)).sum()
+    else:
+        neg_loss = 0
+
+    loss = pos_loss + neg_loss
+
+    # NaN检查
+    if torch.isnan(loss) or torch.isinf(loss):
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    return loss
+```
+
+### 4. 优化器配置
+
+采用**分层学习率**策略：
+
+```python
+optimizer = torch.optim.AdamW([
+    # GNN层使用较大学习率
+    {'params': query_encoder.gnn.parameters(), 'lr': 5e-4},
+    # BERT层使用较小学习率
+    {'params': query_encoder.embedding_layer.parameters(), 'lr': 2e-5},
+], weight_decay=1e-5)
+```
+
+**参数说明：**
+| 参数 | 符号 | 默认值 | 说明 |
+|------|------|--------|------|
+| `learning_rate` | $\eta_{gnn}$ | $5 \times 10^{-4}$ | GNN层学习率 |
+| `bert_learning_rate` | $\eta_{bert}$ | $2 \times 10^{-5}$ | BERT层学习率 |
+| `weight_decay` | $\lambda$ | $10^{-5}$ | 权重衰减系数 |
+| `max_grad_norm` | - | 1.0 | 梯度裁剪阈值 |
+
+### 5. 梯度累积
+
+为了模拟更大的batch size，使用梯度累积：
+
+$$\theta_{t+1} = \theta_t - \eta \cdot \frac{1}{N_{acc}} \sum_{i=1}^{N_{acc}} \nabla_\theta \mathcal{L}_i$$
+
+其中 $N_{acc}$ = `gradient_accumulation_steps`（默认4）。
+
+实际batch size = `batch_size` × `gradient_accumulation_steps` = 16 × 4 = 64
+
+### 6. 混合精度训练（AMP）
+
+使用自动混合精度加速训练：
+
+```python
+from torch.cuda.amp import autocast, GradScaler
+
+scaler = GradScaler(enabled=config.use_amp)
+
+with autocast(enabled=config.use_amp):
+    loss = compute_loss(...)  # 前向传播使用FP16
+
+scaler.scale(loss).backward()  # 反向传播
+scaler.step(optimizer)
+scaler.update()
+```
+
+### 7. 训练配置参数汇总
+
+#### FastTrainingConfig 完整参数表
+
+| 类别 | 参数名 | 类型 | 默认值 | 说明 |
+|------|--------|------|--------|------|
+| **数据路径** | `train_graph_query_path` | str | 必填 | 训练集图查询路径 |
+| | `train_original_data_path` | str | 必填 | 训练集原始数据路径 |
+| | `dev_graph_query_path` | str | 必填 | 验证集图查询路径 |
+| | `dev_original_data_path` | str | 必填 | 验证集原始数据路径 |
+| | `entities_path` | str | 必填 | 实体列表文件路径 |
+| | `relations_path` | str | 必填 | 关系列表文件路径 |
+| **模型配置** | `bert_model_path` | str | "bert-base-uncased" | 预训练BERT模型路径 |
+| | `hidden_dim` | int | 768 | 隐藏层维度 |
+| | `num_query_layers` | int | 3 | 查询编码器GNN层数 |
+| | `num_retriever_layers` | int | 2 | 检索器GNN层数 |
+| | `num_relations` | int | 100 | 关系数量 |
+| **训练配置** | `epochs` | int | 10 | 训练轮数 |
+| | `batch_size` | int | 16 | 批次大小 |
+| | `learning_rate` | float | $5 \times 10^{-4}$ | GNN层学习率 |
+| | `bert_learning_rate` | float | $2 \times 10^{-5}$ | BERT层学习率 |
+| | `weight_decay` | float | $10^{-5}$ | 权重衰减 |
+| | `max_grad_norm` | float | 1.0 | 梯度裁剪阈值 |
+| | `warmup_steps` | int | 100 | 预热步数 |
+| **路径采样** | `num_negatives` | int | 3 | 负样本数/正样本 |
+| | `hard_negative_ratio` | float | 0.5 | 硬负样本比例 |
+| | `max_path_length` | int | 3 | 最大路径长度 |
+| | `max_paths_per_sample` | int | 5 | 每样本最大路径数 |
+| **速度优化** | `use_amp` | bool | True | 混合精度训练 |
+| | `num_workers` | int | 0 | DataLoader进程数 |
+| | `gradient_accumulation_steps` | int | 4 | 梯度累积步数 |
+| | `cache_paths` | bool | True | 是否缓存路径 |
+| | `cache_dir` | str | ".cache" | 缓存目录 |
+| | `compile_model` | bool | False | PyTorch 2.0编译 |
+| **检查点** | `checkpoint_dir` | str | "checkpoints" | 检查点保存目录 |
+| | `save_every` | int | 1 | 每N轮保存检查点 |
+| | `eval_every` | int | 1 | 每N轮验证一次 |
+| **其他** | `device` | str | "cuda"/"cpu" | 训练设备 |
+| | `seed` | int | 42 | 随机种子 |
+| | `max_train_samples` | int | None | 最大训练样本数（测试用） |
+| | `max_dev_samples` | int | None | 最大验证样本数（测试用） |
+
 ## 训练速度优化
 
 ### 优化策略对比
@@ -461,9 +723,93 @@ torchrun --nproc_per_node=2 SPARQ/train_fast.py ...
 SPARQ/
 ├── train.py              # 基础训练入口
 ├── train_fast.py         # 快速训练（优化版本）
+├── evaluate_test.py      # 测试集评估（计算Hit@K）
 ├── TRAINING.md           # 本文件
 └── checkpoints/          # 检查点保存目录
     ├── best.pt           # 最佳模型
     ├── latest.pt         # 最新模型
     └── epoch_*.pt        # 每轮模型
 ```
+
+---
+
+## 测试集评估
+
+训练完成后，使用 `evaluate_test.py` 在测试集上评估模型性能，计算 **Hit@1 ~ Hit@10** 指标。
+
+### Hit@K 指标定义
+
+Hit@K 表示在前 K 条检索路径中至少包含一个正确答案的样本比例：
+
+$$\text{Hit@K} = \frac{1}{N} \sum_{i=1}^{N} \mathbb{1}\left(\exists p \in \text{TopK}(q_i), \text{Answer}(q_i) \cap p \neq \emptyset\right) \times 100\%$$
+
+其中：
+- $N$：测试样本总数
+- $\text{TopK}(q_i)$：查询 $q_i$ 的前 K 条检索路径
+- $\text{Answer}(q_i)$：查询 $q_i$ 的答案实体集合
+- $\mathbb{1}(\cdot)$：指示函数，条件满足时为1，否则为0
+
+### 使用方法
+
+#### 方式1：使用 shell 脚本
+
+```bash
+chmod +x eval_test.sh
+./eval_test.sh checkpoints/best.pt
+```
+
+#### 方式2：直接使用 Python
+
+```bash
+python SPARQ/evaluate_test.py \
+    --test_graph_query_path /root/autodl-tmp/dataset/CWQ/graph_query/graph_query_test.json \
+    --test_original_data_path /root/autodl-tmp/dataset/CWQ/CWQ/test_simple.json \
+    --entities_path /root/autodl-tmp/dataset/CWQ/CWQ/entities.txt \
+    --relations_path /root/autodl-tmp/dataset/CWQ/CWQ/relations.txt \
+    --checkpoint_path checkpoints/best.pt \
+    --bert_model_path /root/autodl-tmp/bert-base-uncased \
+    --beam_width 3 \
+    --max_path_length 3 \
+    --top_k 10 \
+    --output_path output/test_results.json
+```
+
+### 参数说明
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--test_graph_query_path` | str | 必填 | 测试集图查询数据路径 |
+| `--test_original_data_path` | str | 必填 | 测试集原始数据路径 |
+| `--checkpoint_path` | str | 必填 | 训练好的模型检查点路径 |
+| `--beam_width` | int | 3 | 束搜索宽度 |
+| `--max_path_length` | int | 3 | 最大路径长度 |
+| `--top_k` | int | 10 | 计算Hit@K的最大K值 |
+| `--output_path` | str | output/test_results.json | 结果保存路径 |
+
+### 输出结果示例
+
+```
+================================================================================
+Evaluation Results
+================================================================================
+Total samples: 3537
+Valid samples: 3500
+Error samples: 37
+--------------------------------------------------------------------------------
+Hit@ 1:  15.23%
+Hit@ 2:  22.45%
+Hit@ 3:  28.67%
+Hit@ 4:  33.12%
+Hit@ 5:  37.89%
+Hit@ 6:  41.23%
+Hit@ 7:  44.56%
+Hit@ 8:  47.34%
+Hit@ 9:  49.87%
+Hit@10:  52.15%
+================================================================================
+```
+
+结果会保存到 JSON 文件中，包含：
+- 评估配置参数
+- Hit@1 ~ Hit@10 的精确数值
+- 错误样本列表（用于调试）
