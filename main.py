@@ -39,6 +39,7 @@ class GraphRAGConfig:
     max_samples: Optional[int] = None
     output_path: Optional[str] = None
     checkpoint_path: Optional[str] = None
+    save_checkpoint_path: Optional[str] = None
 
 
 class CWQDataset:
@@ -78,7 +79,7 @@ class CWQDataset:
             'id': graph_query['id'],
             'question': graph_query.get('question', ''),
             'triples': graph_query.get('triples', []),
-            'answers': graph_query.get('answers', []),
+            'answers': original_data.get('answers', []),  # 修复：从原始数据获取答案
             'subgraph': original_data.get('subgraph', {}),
             'entities': original_data.get('entities', [])
         }
@@ -277,7 +278,8 @@ def parse_args():
     parser.add_argument("--top_k", type=int, default=10, help="返回路径数")
     parser.add_argument("--max_samples", type=int, default=None, help="最大样本数")
     parser.add_argument("--output_path", type=str, default="output/results.json", help="输出路径")
-    parser.add_argument("--checkpoint_path", type=str, default=None, help="检查点路径")
+    parser.add_argument("--checkpoint_path", type=str, default=None, help="加载检查点路径")
+    parser.add_argument("--save_checkpoint_path", type=str, default=None, help="保存检查点路径（用于保存处理后的模型）")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--verbose", action="store_true", help="详细输出")
     return parser.parse_args()
@@ -306,7 +308,8 @@ def main():
         device=args.device,
         max_samples=args.max_samples,
         output_path=args.output_path,
-        checkpoint_path=args.checkpoint_path
+        checkpoint_path=args.checkpoint_path,
+        save_checkpoint_path=args.save_checkpoint_path
     )
 
     print("\n加载数据...")
@@ -346,6 +349,24 @@ def main():
         with open(config.output_path, 'w', encoding='utf-8') as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)
         print(f"结果保存: {config.output_path}")
+
+    # 保存检查点（如果指定了保存路径）
+    if config.save_checkpoint_path:
+        checkpoint = {
+            'query_encoder_state': pipeline.query_encoder.state_dict(),
+            'retriever_state': pipeline.retriever.state_dict(),
+            'config': {
+                'hidden_dim': config.hidden_dim,
+                'num_query_layers': config.num_query_layers,
+                'num_retriever_layers': config.num_retriever_layers,
+                'num_relations': config.num_relations,
+                'bert_model_path': config.bert_model_path,
+            }
+        }
+        Path(config.save_checkpoint_path).parent.mkdir(parents=True, exist_ok=True)
+        torch.save(checkpoint, config.save_checkpoint_path)
+        print(f"检查点保存: {config.save_checkpoint_path}")
+
     print("=" * 80)
 
 

@@ -250,9 +250,41 @@ class FastGraphRAGTrainer:
         # 路径采样器
         self.path_sampler = CachedPathSampler(config)
 
+        # 加载实体映射（kb_id -> 索引）
+        self.entity2idx = self._load_entity_mapping()
+
         # 统计
         self.global_step = 0
         self.best_metric = 0.0
+
+    def _load_entity_mapping(self) -> Dict[str, int]:
+        """加载实体映射（kb_id -> 索引）"""
+        print(f"Loading entity mapping from {self.config.entities_path}...")
+        entity2idx = {}
+        with open(self.config.entities_path, 'r', encoding='utf-8') as f:
+            for idx, line in enumerate(f):
+                kb_id = line.strip()
+                entity2idx[kb_id] = idx
+        print(f"Loaded {len(entity2idx)} entities")
+        return entity2idx
+
+    def extract_answer_entities(self, sample: Dict) -> List[int]:
+        """
+        从样本中提取答案实体的索引
+
+        Returns:
+            answer_indices: 答案实体在entities.txt中的索引列表
+        """
+        answer_entities = []
+
+        # 从answers字段提取kb_id并映射到索引
+        for ans in sample.get('answers', []):
+            if isinstance(ans, dict) and 'kb_id' in ans:
+                kb_id = ans['kb_id']
+                if kb_id in self.entity2idx:
+                    answer_entities.append(self.entity2idx[kb_id])
+
+        return answer_entities
 
     def _init_model(self):
         """初始化模型"""
@@ -282,9 +314,9 @@ class FastGraphRAGTrainer:
             'path_encoder': path_encoder
         })
 
-        # 冻结 path_encoder，只训练 query_encoder（节省显存）
-        for param in path_encoder.parameters():
-            param.requires_grad = False
+        # 解冻 path_encoder，让它参与训练（修复：原来被冻结导致无法学习）
+        # for param in path_encoder.parameters():
+        #     param.requires_grad = False
 
         # 冻结BERT前几层（可选，加速训练）
         # for param in query_encoder.embedding_layer.bert.encoder.layer[:6].parameters():
@@ -306,11 +338,12 @@ class FastGraphRAGTrainer:
         return model
 
     def _init_optimizer(self):
-        """初始化优化器（只训练 query_encoder）"""
+        """初始化优化器（训练 query_encoder 和 path_encoder）"""
         # 分层学习率
         param_groups = [
             {'params': self.model['query_encoder'].gnn.parameters(), 'lr': self.config.learning_rate},
-            # path_encoder 已冻结，不加入优化器
+            # 修复：加入 path_encoder 参与训练
+            {'params': self.model['path_encoder'].parameters(), 'lr': self.config.learning_rate},
             {'params': self.model['query_encoder'].embedding_layer.parameters(), 'lr': self.config.bert_learning_rate},
         ]
 
@@ -405,22 +438,21 @@ class FastGraphRAGTrainer:
         if not subgraph_tuples:
             return 0.0
 
-        # 获取答案实体（从answers字段解析）
-        answer_entities = []
-        for ans in sample.get('answers', []):
-            if isinstance(ans, dict) and 'kb_id' in ans:
-                # 尝试找到答案实体的索引
-                # 简化：使用话题实体附近的节点作为潜在答案
-                pass
+        # 修复：正确提取答案实体的索引
+        answer_entities = self.extract_answer_entities(sample)
 
-        # 如果没有明确答案，使用路径终点作为答案
+        # 获取话题实体
         topic_entities = sample['entities']
 
-        # 采样路径
+        # 如果没有找到答案实体，跳过这个样本
+        if not answer_entities:
+            return 0.0
+
+        # 采样路径（使用正确的答案实体）
         pos_paths, neg_paths = self.path_sampler.sample_paths_for_training(
             sample['id'],
             topic_entities,
-            topic_entities,  # 使用话题实体作为答案候选
+            answer_entities,  # 修复：使用真实答案实体，而不是话题实体
             subgraph_tuples,
             self.device
         )
@@ -449,48 +481,42 @@ class FastGraphRAGTrainer:
         else:
             query_emb = query_result
 
-        # path_encoder 已冻结，使用 torch.no_grad() 节省显存
-        with torch.no_grad():
-            # 分批处理路径
-            max_paths_per_batch = 5
+        # 修复：path_encoder 现在参与训练，需要计算梯度
+        # 分批处理路径
+        max_paths_per_batch = 5
 
-            def encode_paths_batch(paths_list):
-                """分批编码路径"""
-                all_embs = []
-                for i in range(0, len(paths_list), max_paths_per_batch):
-                    batch_paths = paths_list[i:i + max_paths_per_batch]
-                    batch_embs = []
-                    for path_nodes, path_rels in batch_paths:
-                        local_nodes = [global_to_local(n) for n in path_nodes]
-                        if -1 in local_nodes or len(local_nodes) == 0:
-                            continue
-                        local_rels = [r % self.config.num_relations for r in path_rels]
-                        path_emb = self.model['path_encoder'](
-                            node_features, local_nodes, local_rels
-                        )
-                        batch_embs.append(path_emb)
-                    all_embs.extend(batch_embs)
-                return all_embs
+        def encode_paths_batch(paths_list):
+            """分批编码路径"""
+            all_embs = []
+            for i in range(0, len(paths_list), max_paths_per_batch):
+                batch_paths = paths_list[i:i + max_paths_per_batch]
+                batch_embs = []
+                for path_nodes, path_rels in batch_paths:
+                    local_nodes = [global_to_local(n) for n in path_nodes]
+                    if -1 in local_nodes or len(local_nodes) == 0:
+                        continue
+                    local_rels = [r % self.config.num_relations for r in path_rels]
+                    path_emb = self.model['path_encoder'](
+                        node_features, local_nodes, local_rels
+                    )
+                    batch_embs.append(path_emb)
+                all_embs.extend(batch_embs)
+            return all_embs
 
-            # 编码正样本路径
-            pos_embs = encode_paths_batch(pos_paths)
-            if not pos_embs:
-                del node_features
-                return 0.0
-
-            # 编码负样本路径
-            neg_embs = encode_paths_batch(neg_paths)
-
-            # 清理node_features
+        # 编码正样本路径
+        pos_embs = encode_paths_batch(pos_paths)
+        if not pos_embs:
             del node_features
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            return 0.0
+
+        # 编码负样本路径
+        neg_embs = encode_paths_batch(neg_paths)
 
         # 计算损失（需要梯度）
         loss = self.contrastive_loss(query_emb, pos_embs, neg_embs)
 
         # 清理中间变量释放显存
-        del pos_embs, neg_embs, query_emb
+        del node_features, pos_embs, neg_embs, query_emb
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -662,6 +688,14 @@ def parse_args():
     parser.add_argument("--cache_paths", action="store_true", default=True)
     parser.add_argument("--compile_model", action="store_true", default=False)
 
+    # 检查点配置
+    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints",
+                        help="检查点保存目录 (默认: checkpoints)")
+    parser.add_argument("--save_every", type=int, default=1,
+                        help="每多少轮保存一次检查点 (默认: 1)")
+    parser.add_argument("--eval_every", type=int, default=1,
+                        help="每多少轮验证一次 (默认: 1)")
+
     # 快速测试
     parser.add_argument("--max_train_samples", type=int, default=None)
     parser.add_argument("--max_dev_samples", type=int, default=None)
@@ -697,6 +731,9 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         cache_paths=args.cache_paths,
         compile_model=args.compile_model,
+        checkpoint_dir=args.checkpoint_dir,
+        save_every=args.save_every,
+        eval_every=args.eval_every,
         max_train_samples=args.max_train_samples,
         max_dev_samples=args.max_dev_samples
     )
@@ -708,6 +745,7 @@ def main():
     print(f"AMP: {config.use_amp}")
     print(f"Gradient Accumulation: {config.gradient_accumulation_steps}")
     print(f"Path Cache: {config.cache_paths}")
+    print(f"Checkpoint Dir: {config.checkpoint_dir}")
 
     # 创建训练器
     trainer = FastGraphRAGTrainer(config)

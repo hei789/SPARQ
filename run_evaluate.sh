@@ -8,9 +8,9 @@ python evaluate_test.py \
     --test_original_data_path /root/autodl-tmp/dataset/CWQ/CWQ/test_simple.json \
     --entities_path /root/autodl-tmp/dataset/CWQ/CWQ/entities.txt \
     --relations_path /root/autodl-tmp/dataset/CWQ/CWQ/relations.txt \
-    --checkpoint_path output/checkpoint_best.pt \
+    --checkpoint_path /root/autodl-tmp/checkpoints/best.pt \
     --bert_model_path /root/autodl-tmp/bert-base-uncased \
     --beam_width 3 \
     --max_path_length 3 \
     --top_k 10 \
-    --output_path output/test_results.json
+    --output_path /root/autodl-tmp/output/test_results.json
