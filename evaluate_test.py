@@ -23,6 +23,13 @@ from graph_retriever import GraphRetriever
 from main import CWQDataset, GraphRAGConfig, SubgraphProcessor
 
 
+# 兼容 train_fast.py 保存的检查点
+@dataclass
+class FastTrainingConfig:
+    """占位类，用于加载 train_fast.py 保存的检查点"""
+    pass
+
+
 @dataclass
 class EvalConfig:
     """评估配置"""
@@ -302,6 +309,10 @@ class GraphRAGEvaluator:
         max_samples = len(self.dataset) if self.config.max_samples is None \
                       else min(self.config.max_samples, len(self.dataset))
 
+        # 计算每 2% 的进度间隔
+        progress_interval = max(1, max_samples // 50)  # 2% = 1/50
+        last_progress = -1
+
         for idx in tqdm(range(max_samples), desc="Evaluating"):
             result = self.evaluate_sample(idx)
 
@@ -317,6 +328,21 @@ class GraphRAGEvaluator:
                     hit_counts[f'Hit@{k}'] += 1
 
             total_samples += 1
+
+            # 每 2% 进度输出中间结果
+            current_progress = (idx + 1) // progress_interval
+            if current_progress > last_progress and valid_samples > 0:
+                last_progress = current_progress
+                progress_pct = min((idx + 1) * 100 // max_samples, 100)
+
+                # 计算当前命中率
+                print(f"\n[进度 {progress_pct}%] 中间结果 (已处理 {valid_samples} 个有效样本):")
+                hit_rates = []
+                for k in [1, 3, 5, 10]:
+                    if k <= self.config.top_k:
+                        hit_rate = hit_counts[f'Hit@{k}'] / valid_samples * 100
+                        hit_rates.append(f"Hit@{k}: {hit_rate:5.2f}%")
+                print("  " + " | ".join(hit_rates))
 
         # 计算命中率
         metrics = {}
