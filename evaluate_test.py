@@ -222,6 +222,23 @@ class GraphRAGEvaluator:
         if node_features is None or node_features.size(0) == 0:
             return {"id": sample['id'], "error": "Empty subgraph"}
 
+        # 创建反向映射：局部索引 -> 实体行号
+        local2entity_idx = {v: k for k, v in entity_idx2local.items()}
+
+        # 构建关系映射：局部关系索引 -> 关系名称
+        # 注意：edge_types 中的值是 relation2idx[r] = next_rel_idx % num_relations
+        # 所以需要建立反向映射
+        relation_line2local = {}  # 关系行号 -> 局部索引
+        local2relation_line = {}  # 局部索引 -> 关系行号（取第一个）
+        next_rel_idx = 0
+        for h, r, t in subgraph_data.get('tuples', []):
+            if r not in relation_line2local:
+                local_idx = next_rel_idx % self.config.num_relations
+                relation_line2local[r] = local_idx
+                if local_idx not in local2relation_line:
+                    local2relation_line[local_idx] = r
+                next_rel_idx += 1
+
         # 将答案实体映射到局部索引
         local_answer_entities = set()
         for ans_idx in answer_entities:
@@ -289,21 +306,77 @@ class GraphRAGEvaluator:
                     break
             hits[f'Hit@{k}'] = hit
 
+        # 将路径转换为实体名称和关系名称
+        readable_paths = []
+        for path in top_k_paths[:5]:  # 只转换前5条路径
+            path_nodes = path['nodes']
+            path_rels = path['relations']
+
+            # 将局部索引转换为实体名称
+            entity_names = []
+            for local_idx in path_nodes:
+                entity_line = local2entity_idx.get(local_idx, -1)
+                if 0 <= entity_line < len(self.dataset.entities):
+                    entity_names.append(self.dataset.entities[entity_line])
+                else:
+                    entity_names.append(f"entity_{entity_line}")
+
+            # 将关系索引转换为关系名称
+            rel_names = []
+            for rel_local_idx in path_rels:
+                # 从 local2relation_line 中找到原始关系行号
+                rel_line = local2relation_line.get(rel_local_idx, rel_local_idx)
+                rel_name = self.dataset.relations[rel_line] if rel_line < len(self.dataset.relations) else f"rel_{rel_line}"
+                rel_names.append(rel_name)
+
+            # 构建可读路径字符串
+            path_str = entity_names[0]
+            for i, rel_name in enumerate(rel_names):
+                if i + 1 < len(entity_names):
+                    path_str += f" --{rel_name}--> {entity_names[i + 1]}"
+
+            readable_paths.append({
+                'path_indices': path_nodes,
+                'path_entities': entity_names,
+                'path_relations': rel_names,
+                'path_string': path_str,
+                'similarity': path['similarity'],
+                'contains_answer': bool(set(path_nodes) & local_answer_entities)
+            })
+
+        # 获取答案实体的名称
+        answer_entity_names = []
+        for ans_local in local_answer_entities:
+            ans_line = local2entity_idx.get(ans_local, -1)
+            if 0 <= ans_line < len(self.dataset.entities):
+                answer_entity_names.append(self.dataset.entities[ans_line])
+
+        # 获取话题实体的名称
+        topic_entity_names = []
+        for topic_local in local_topic_entities:
+            topic_line = local2entity_idx.get(topic_local, -1)
+            if 0 <= topic_line < len(self.dataset.entities):
+                topic_entity_names.append(self.dataset.entities[topic_line])
+
         return {
             'id': sample['id'],
             'question': question,
             'num_answer_entities': len(local_answer_entities),
             'num_paths_found': len(all_paths),
             'hits': hits,
-            'top_paths': top_k_paths[:5]  # 只保存前5条路径详情
+            'top_paths': top_k_paths[:5],  # 原始路径详情
+            'readable_paths': readable_paths,  # 可读路径
+            'answer_entity_names': answer_entity_names,  # 答案实体名称
+            'topic_entity_names': topic_entity_names  # 话题实体名称
         }
 
-    def evaluate(self) -> Dict[str, float]:
+    def evaluate(self) -> Tuple[Dict[str, float], List[Dict]]:
         """
         评估整个测试集
 
         返回:
             metrics: 包含Hit@1~Hit@10的字典
+            error_samples: 错误样本列表
         """
         print(f"\nEvaluating on {len(self.dataset)} test samples...")
 
@@ -312,6 +385,7 @@ class GraphRAGEvaluator:
         total_samples = 0
         valid_samples = 0
         error_samples = []
+        detailed_results = []  # 收集详细结果用于保存
 
         # 限制样本数
         max_samples = len(self.dataset) if self.config.max_samples is None \
@@ -336,6 +410,20 @@ class GraphRAGEvaluator:
                     hit_counts[f'Hit@{k}'] += 1
 
             total_samples += 1
+
+            # 收集详细结果
+            if 'readable_paths' in result:
+                detailed_results.append({
+                    'id': result['id'],
+                    'question': result['question'],
+                    'topic_entities': result.get('topic_entity_names', []),
+                    'answer_entities': result.get('answer_entity_names', []),
+                    'hit@1': result['hits'].get('Hit@1', False),
+                    'hit@5': result['hits'].get('Hit@5', False),
+                    'hit@10': result['hits'].get('Hit@10', False),
+                    'num_paths_found': result['num_paths_found'],
+                    'retrieved_paths': result['readable_paths']
+                })
 
             # 每 2% 进度输出中间结果
             current_progress = (idx + 1) // progress_interval
@@ -362,7 +450,7 @@ class GraphRAGEvaluator:
         metrics['valid_samples'] = valid_samples
         metrics['error_samples'] = len(error_samples)
 
-        return metrics, error_samples
+        return metrics, error_samples, detailed_results
 
     def run(self):
         """运行评估"""
@@ -389,7 +477,7 @@ class GraphRAGEvaluator:
         print(f"Test samples: {len(dataset)}")
 
         # 运行评估
-        metrics, error_samples = self.evaluate()
+        metrics, error_samples, detailed_results = self.evaluate()
 
         # 打印结果
         print("\n" + "=" * 80)
@@ -426,6 +514,13 @@ class GraphRAGEvaluator:
             with open(self.config.output_path, 'w', encoding='utf-8') as f:
                 json.dump(output, f, indent=2, ensure_ascii=False)
             print(f"\nResults saved to {self.config.output_path}")
+
+            # 保存详细路径结果
+            if detailed_results:
+                vis_path = str(Path(self.config.output_path).with_suffix('.paths.json'))
+                with open(vis_path, 'w', encoding='utf-8') as f:
+                    json.dump(detailed_results, f, indent=2, ensure_ascii=False)
+                print(f"Detailed paths saved to {vis_path}")
 
         return metrics
 
