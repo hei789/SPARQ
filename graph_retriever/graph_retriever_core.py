@@ -157,6 +157,12 @@ class RGCNLayer(nn.Module):
         # 自环连接
         out = torch.matmul(x, self.loop_weight)
 
+        # 处理空边的情况
+        if edge_index.numel() == 0 or edge_index.size(0) == 0 or edge_index.size(1) == 0:
+            out = out + self.bias
+            out = self.dropout(out)
+            return out
+
         # 消息传递
         src, dst = edge_index[0], edge_index[1]
 
@@ -322,8 +328,14 @@ class GraphRetriever(nn.Module):
 
         # 构建邻接表
         adj_list = [[] for _ in range(num_nodes)]
-        src, dst = edge_index[0].tolist(), edge_index[1].tolist()
-        edge_type_list = edge_types.tolist()
+
+        # 处理空边的情况
+        if edge_index.numel() > 0 and edge_index.size(0) >= 2 and edge_index.size(1) > 0:
+            src, dst = edge_index[0].tolist(), edge_index[1].tolist()
+            edge_type_list = edge_types.tolist()
+        else:
+            src, dst = [], []
+            edge_type_list = []
 
         for s, d, et in zip(src, dst, edge_type_list):
             adj_list[s].append((d, et))  # (邻居节点, 关系类型)
