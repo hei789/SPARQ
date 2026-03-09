@@ -26,7 +26,7 @@ class ReasoningPath:
 
 class PathEncoder(nn.Module):
     """
-    推理路径编码器
+    推理路径编码器 (LSTM版本)
     将路径编码为向量表示
     """
 
@@ -100,6 +100,153 @@ class PathEncoder(nn.Module):
         # 使用最终的隐藏状态
         path_embedding = torch.cat([h_n[0], h_n[1]], dim=-1)  # (hidden_dim*2,)
         path_embedding = self.output_projection(path_embedding)
+
+        return path_embedding
+
+
+class GNNPathEncoder(nn.Module):
+    """
+    GNN路径编码器
+    利用子图结构信息编码路径，相比LSTM能更好地捕捉路径的图结构上下文
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int = 768,
+        num_relations: int = 100,
+        num_gnn_layers: int = 2,
+        dropout: float = 0.1,
+        use_path_attention: bool = True
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_gnn_layers = num_gnn_layers
+        self.use_path_attention = use_path_attention
+
+        # GNN层用于编码子图（在子图上做消息传递，捕捉上下文）
+        self.gnn_layers = nn.ModuleList([
+            RGCNLayer(
+                in_dim=hidden_dim if i == 0 else hidden_dim,
+                out_dim=hidden_dim,
+                num_relations=num_relations,
+                dropout=dropout
+            )
+            for i in range(num_gnn_layers)
+        ])
+
+        self.layer_norms = nn.ModuleList([
+            nn.LayerNorm(hidden_dim) for _ in range(num_gnn_layers)
+        ])
+
+        # 路径注意力机制：学习路径上不同节点的重要性
+        if use_path_attention:
+            self.path_attention = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim // 2),
+                nn.Tanh(),
+                nn.Linear(hidden_dim // 2, 1)
+            )
+
+        # 路径位置编码（学习路径中节点的顺序信息）
+        self.max_path_length = 10  # 假设最大路径长度
+        self.position_embedding = nn.Embedding(self.max_path_length, hidden_dim)
+
+        # 输出投影
+        self.output_projection = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+
+        # 全局上下文聚合
+        self.global_context = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+
+    def encode_subgraph(
+        self,
+        node_features: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_types: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        使用GNN编码整个子图
+
+        Args:
+            node_features: 节点初始特征 (num_nodes, hidden_dim)
+            edge_index: 边索引 (2, num_edges)
+            edge_types: 边类型 (num_edges,)
+
+        Returns:
+            encoded_features: 编码后的节点特征 (num_nodes, hidden_dim)
+        """
+        x = node_features
+        for layer, norm in zip(self.gnn_layers, self.layer_norms):
+            x = layer(x, edge_index, edge_types)
+            x = norm(x)
+        return x
+
+    def forward(
+        self,
+        node_features: torch.Tensor,
+        path_nodes: List[int],
+        path_relations: List[int],
+        edge_index: Optional[torch.Tensor] = None,
+        edge_types: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        编码路径（使用GNN编码子图上下文 + 路径注意力）
+
+        Args:
+            node_features: 节点初始特征 (num_nodes, hidden_dim)
+            path_nodes: 路径上的节点索引列表
+            path_relations: 路径上的关系索引列表
+            edge_index: 子图边索引 (2, num_edges)，可选
+            edge_types: 子图边类型 (num_edges,)，可选
+
+        Returns:
+            path_embedding: 路径的向量表示 (hidden_dim,)
+        """
+        if len(path_nodes) == 0:
+            return torch.zeros(self.hidden_dim, device=node_features.device)
+
+        device = node_features.device
+
+        # 步骤1: 在整个子图上做GNN消息传递（如果有边信息）
+        if edge_index is not None and edge_index.numel() > 0:
+            encoded_features = self.encode_subgraph(node_features, edge_index, edge_types)
+        else:
+            # 如果没有边信息，直接使用节点特征
+            encoded_features = node_features
+
+        # 步骤2: 提取路径上的节点特征
+        path_node_feats = encoded_features[path_nodes]  # (path_len, hidden_dim)
+
+        # 步骤3: 添加位置编码（捕捉路径顺序）
+        path_length = len(path_nodes)
+        positions = torch.arange(path_length, device=device).clamp(0, self.max_path_length - 1)
+        pos_emb = self.position_embedding(positions)  # (path_len, hidden_dim)
+        path_node_feats = path_node_feats + pos_emb
+
+        # 步骤4: 路径注意力池化
+        if self.use_path_attention and path_length > 1:
+            # 计算每个节点的注意力权重
+            attn_scores = self.path_attention(path_node_feats)  # (path_len, 1)
+            attn_weights = torch.softmax(attn_scores, dim=0)
+
+            # 加权求和
+            path_context = (path_node_feats * attn_weights).sum(dim=0)  # (hidden_dim,)
+        else:
+            # 平均池化
+            path_context = path_node_feats.mean(dim=0)  # (hidden_dim,)
+
+        # 步骤5: 计算路径的全局上下文（子图均值）
+        global_context = self.global_context(encoded_features.mean(dim=0))  # (hidden_dim,)
+
+        # 步骤6: 结合路径上下文和全局上下文
+        combined = torch.cat([path_context, global_context], dim=-1)  # (hidden_dim * 2,)
+        path_embedding = self.output_projection(combined)  # (hidden_dim,)
 
         return path_embedding
 
@@ -203,13 +350,16 @@ class GraphRetriever(nn.Module):
         dropout: float = 0.1,
         beam_width: int = 3,
         max_path_length: int = 3,
-        similarity_threshold: float = 0.5
+        similarity_threshold: float = 0.5,
+        path_encoder_type: str = "gnn",  # "lstm" 或 "gnn"
+        path_encoder_layers: int = 2
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.beam_width = beam_width
         self.max_path_length = max_path_length
         self.similarity_threshold = similarity_threshold
+        self.path_encoder_type = path_encoder_type
 
         # GNN用于编码子图
         self.gnn_layers = nn.ModuleList([
@@ -226,12 +376,21 @@ class GraphRetriever(nn.Module):
             nn.LayerNorm(hidden_dim) for _ in range(num_gnn_layers)
         ])
 
-        # 路径编码器
-        self.path_encoder = PathEncoder(
-            hidden_dim=hidden_dim,
-            num_relations=num_relations,
-            dropout=dropout
-        )
+        # 路径编码器（可选择LSTM或GNN版本）
+        if path_encoder_type == "gnn":
+            self.path_encoder = GNNPathEncoder(
+                hidden_dim=hidden_dim,
+                num_relations=num_relations,
+                num_gnn_layers=path_encoder_layers,
+                dropout=dropout,
+                use_path_attention=True
+            )
+        else:
+            self.path_encoder = PathEncoder(
+                hidden_dim=hidden_dim,
+                num_relations=num_relations,
+                dropout=dropout
+            )
 
         # 查询-路径相似度计算
         self.similarity_scorer = nn.Sequential(
@@ -346,6 +505,22 @@ class GraphRetriever(nn.Module):
         beams = [(0.0, [start_node], [])]
         completed_paths = []
 
+        # 如果使用GNN路径编码器，预先生成边信息用于子图编码
+        edge_index_for_path = None
+        edge_types_for_path = None
+        if self.path_encoder_type == "gnn":
+            # 从邻接表重建边索引
+            edge_list = []
+            edge_type_list = []
+            for src_node in range(num_nodes):
+                for dst_node, rel_type in adj_list[src_node]:
+                    if src_node < dst_node:  # 避免重复边（无向图）
+                        edge_list.append([src_node, dst_node])
+                        edge_type_list.append(rel_type)
+            if edge_list:
+                edge_index_for_path = torch.tensor(edge_list, dtype=torch.long, device=device).t()
+                edge_types_for_path = torch.tensor(edge_type_list, dtype=torch.long, device=device)
+
         for step in range(self.max_path_length):
             candidates = []
 
@@ -362,9 +537,15 @@ class GraphRetriever(nn.Module):
                     new_path_relations = path_relations + [rel_type]
 
                     # 编码新路径
-                    path_embedding = self.path_encoder(
-                        node_features, new_path_nodes, new_path_relations
-                    )
+                    if self.path_encoder_type == "gnn":
+                        path_embedding = self.path_encoder(
+                            node_features, new_path_nodes, new_path_relations,
+                            edge_index_for_path, edge_types_for_path
+                        )
+                    else:
+                        path_embedding = self.path_encoder(
+                            node_features, new_path_nodes, new_path_relations
+                        )
 
                     # 计算与查询的相似度
                     similarity = self.compute_path_query_similarity(
@@ -403,9 +584,15 @@ class GraphRetriever(nn.Module):
 
         # 添加beams中剩余的路径
         for score, path_nodes, path_relations in beams:
-            path_embedding = self.path_encoder(
-                node_features, path_nodes, path_relations
-            )
+            if self.path_encoder_type == "gnn":
+                path_embedding = self.path_encoder(
+                    node_features, path_nodes, path_relations,
+                    edge_index_for_path, edge_types_for_path
+                )
+            else:
+                path_embedding = self.path_encoder(
+                    node_features, path_nodes, path_relations
+                )
             similarity = self.compute_path_query_similarity(
                 path_embedding, query_embedding
             )
@@ -498,9 +685,15 @@ class GraphRetriever(nn.Module):
         # 4. 编码最终选择的路径
         path_embeddings = []
         for path in top_paths:
-            emb = self.path_encoder(
-                encoded_features, path.nodes, path.relations
-            )
+            if self.path_encoder_type == "gnn":
+                emb = self.path_encoder(
+                    encoded_features, path.nodes, path.relations,
+                    edge_index, edge_types
+                )
+            else:
+                emb = self.path_encoder(
+                    encoded_features, path.nodes, path.relations
+                )
             path_embeddings.append(emb)
 
         if len(path_embeddings) > 0:

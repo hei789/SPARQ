@@ -53,6 +53,10 @@ class EvalConfig:
     similarity_threshold: float = 0.0
     top_k: int = 10  # 计算Hit@K的最大K值
 
+    # 路径编码器配置
+    path_encoder_type: str = "gnn"  # "lstm" 或 "gnn"
+    path_encoder_layers: int = 2
+
     # 设备
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     max_samples: Optional[int] = None
@@ -83,13 +87,28 @@ class GraphRAGEvaluator:
             use_bfs_gnn=True
         )
 
+        # 加载检查点以获取配置（如果可用）
+        checkpoint = torch.load(self.config.checkpoint_path, map_location=self.device)
+
+        # 从checkpoint中读取路径编码器配置（如果存在）
+        path_encoder_type = self.config.path_encoder_type
+        path_encoder_layers = self.config.path_encoder_layers
+        if 'config' in checkpoint:
+            ckpt_config = checkpoint['config']
+            if hasattr(ckpt_config, 'path_encoder_type'):
+                path_encoder_type = ckpt_config.path_encoder_type
+                path_encoder_layers = ckpt_config.path_encoder_layers
+                print(f"Using path encoder from checkpoint: {path_encoder_type} (layers={path_encoder_layers})")
+
         retriever = GraphRetriever(
             hidden_dim=self.config.hidden_dim,
             num_gnn_layers=self.config.num_retriever_layers,
             num_relations=self.config.num_relations,
             beam_width=self.config.beam_width,
             max_path_length=self.config.max_path_length,
-            similarity_threshold=self.config.similarity_threshold
+            similarity_threshold=self.config.similarity_threshold,
+            path_encoder_type=path_encoder_type,
+            path_encoder_layers=path_encoder_layers
         )
 
         # 修复：保存完整的 retriever，不只是 path_encoder
@@ -97,9 +116,6 @@ class GraphRAGEvaluator:
             'query_encoder': query_encoder,
             'retriever': retriever
         }).to(self.device)
-
-        # 加载检查点
-        checkpoint = torch.load(self.config.checkpoint_path, map_location=self.device)
 
         if 'model_state_dict' in checkpoint:
             state_dict = checkpoint['model_state_dict']
@@ -563,6 +579,13 @@ def parse_args():
     parser.add_argument("--top_k", type=int, default=10,
                         help="计算Hit@K的最大K值")
 
+    # 路径编码器配置
+    parser.add_argument("--path_encoder_type", type=str, default="gnn",
+                        choices=["lstm", "gnn"],
+                        help="路径编码器类型: lstm 或 gnn (默认: gnn，若checkpoint中有配置则优先使用checkpoint的)")
+    parser.add_argument("--path_encoder_layers", type=int, default=2,
+                        help="GNN路径编码器的层数 (默认: 2)")
+
     # 其他配置
     parser.add_argument("--device", type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -593,6 +616,8 @@ def main():
         max_path_length=args.max_path_length,
         similarity_threshold=args.similarity_threshold,
         top_k=args.top_k,
+        path_encoder_type=args.path_encoder_type,
+        path_encoder_layers=args.path_encoder_layers,
         device=args.device,
         max_samples=args.max_samples,
         output_path=args.output_path

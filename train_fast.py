@@ -67,6 +67,10 @@ class FastTrainingConfig:
     max_path_length: int = 3
     max_paths_per_sample: int = 5  # 限制每样本路径数
 
+    # 路径编码器配置
+    path_encoder_type: str = "gnn"  # "lstm" 或 "gnn"
+    path_encoder_layers: int = 2  # GNN路径编码器的层数
+
     # 速度优化配置
     use_amp: bool = True  # 混合精度训练，加速2-3倍
     num_workers: int = 0  # DataLoader进程数，0表示主进程（避免BERT序列化问题）
@@ -303,7 +307,9 @@ class FastGraphRAGTrainer:
         retriever = GraphRetriever(
             hidden_dim=self.config.hidden_dim,
             num_gnn_layers=self.config.num_retriever_layers,
-            num_relations=self.config.num_relations
+            num_relations=self.config.num_relations,
+            path_encoder_type=self.config.path_encoder_type,
+            path_encoder_layers=self.config.path_encoder_layers
         )
 
         # 组合模型 - 保存完整的 retriever 以便训练 GNN 层
@@ -469,6 +475,28 @@ class FastGraphRAGTrainer:
         def global_to_local(global_idx):
             return entity_idx2local.get(global_idx, -1)
 
+        # 如果使用GNN路径编码器，构建边信息
+        edge_index_for_path = None
+        edge_types_for_path = None
+        if self.config.path_encoder_type == "gnn":
+            edges = []
+            edge_types = []
+            relation2idx = {}
+            next_rel_idx = 0
+            for h, r, t in subgraph_tuples:
+                src = global_to_local(h)
+                dst = global_to_local(t)
+                if src == -1 or dst == -1:
+                    continue
+                if r not in relation2idx:
+                    relation2idx[r] = next_rel_idx % self.config.num_relations
+                    next_rel_idx += 1
+                edges.append([src, dst])
+                edge_types.append(relation2idx[r])
+            if edges:
+                edge_index_for_path = torch.tensor(edges, dtype=torch.long, device=self.device).t()
+                edge_types_for_path = torch.tensor(edge_types, dtype=torch.long, device=self.device)
+
         # 编码查询（需要梯度）
         query_result = self.model['query_encoder'](
             sample['triples'],
@@ -494,9 +522,17 @@ class FastGraphRAGTrainer:
                     if -1 in local_nodes or len(local_nodes) == 0:
                         continue
                     local_rels = [r % self.config.num_relations for r in path_rels]
-                    path_emb = self.model['retriever'].path_encoder(
-                        node_features, local_nodes, local_rels
-                    )
+
+                    # 根据路径编码器类型选择调用方式
+                    if self.config.path_encoder_type == "gnn":
+                        path_emb = self.model['retriever'].path_encoder(
+                            node_features, local_nodes, local_rels,
+                            edge_index_for_path, edge_types_for_path
+                        )
+                    else:
+                        path_emb = self.model['retriever'].path_encoder(
+                            node_features, local_nodes, local_rels
+                        )
                     batch_embs.append(path_emb)
                 all_embs.extend(batch_embs)
             return all_embs
@@ -682,12 +718,19 @@ def parse_args():
     parser.add_argument("--cache_paths", action="store_true", default=True)
     parser.add_argument("--compile_model", action="store_true", default=False)
 
+    # 路径编码器配置
+    parser.add_argument("--path_encoder_type", type=str, default="gnn",
+                        choices=["lstm", "gnn"],
+                        help="路径编码器类型: lstm 或 gnn (默认: gnn)")
+    parser.add_argument("--path_encoder_layers", type=int, default=2,
+                        help="GNN路径编码器的层数 (默认: 2)")
+
     # 检查点配置
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints",
                         help="检查点保存目录 (默认: checkpoints)")
     parser.add_argument("--eval_every", type=int, default=1,
                         help="每多少轮验证一次 (默认: 1)")
-    # 注意: save_every 参数已移除，现在只保留 latest.pt 和 best.pt"
+    # 注意: save_every 参数已移除，现在只保留 latest.pt 和 best.pt
 
     # 快速测试
     parser.add_argument("--max_train_samples", type=int, default=None)
@@ -724,6 +767,8 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         cache_paths=args.cache_paths,
         compile_model=args.compile_model,
+        path_encoder_type=args.path_encoder_type,
+        path_encoder_layers=args.path_encoder_layers,
         checkpoint_dir=args.checkpoint_dir,
         eval_every=args.eval_every,
         max_train_samples=args.max_train_samples,
@@ -737,6 +782,7 @@ def main():
     print(f"AMP: {config.use_amp}")
     print(f"Gradient Accumulation: {config.gradient_accumulation_steps}")
     print(f"Path Cache: {config.cache_paths}")
+    print(f"Path Encoder: {config.path_encoder_type.upper()} (layers={config.path_encoder_layers})")
     print(f"Checkpoint Dir: {config.checkpoint_dir}")
 
     # 创建训练器
