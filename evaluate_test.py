@@ -38,6 +38,7 @@ class EvalConfig:
     test_original_data_path: str
     entities_path: str
     relations_path: str
+    entity_names_path: str = ""  # 实体名称文件路径，用于BERT语义编码
 
     # 模型配置
     checkpoint_path: str
@@ -63,6 +64,109 @@ class EvalConfig:
     output_path: Optional[str] = None
 
 
+class EntityNameEncoder:
+    """实体名称编码器 - 用BERT编码实体名称提供语义特征"""
+
+    def __init__(self, entity_names_path: str, bert_model_name: str = "bert-base-uncased", device: str = "cuda"):
+        """
+        Args:
+            entity_names_path: entity_name.txt 路径，格式为 "entity_id\tentity_name"
+            bert_model_name: BERT模型名称
+            device: 设备
+        """
+        self.device = device
+        self.entity_names_path = entity_names_path
+
+        # 加载实体名称映射 (entity_id -> name)
+        self.idx2name = {}
+        if entity_names_path and os.path.exists(entity_names_path):
+            print(f"Loading entity names from {entity_names_path}...")
+            with open(entity_names_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    parts = line.strip().split('\t')
+                    if len(parts) >= 2:
+                        entity_id, name = parts[0], parts[1]
+                        if name != "None":
+                            self.idx2name[entity_id] = name
+            print(f"Loaded {len(self.idx2name)} entity names")
+
+        # 初始化BERT tokenizer和模型（用于编码实体名称）
+        from transformers import BertTokenizer, BertModel
+        print(f"Loading BERT for entity name encoding: {bert_model_name}")
+        self.tokenizer = BertTokenizer.from_pretrained(bert_model_name)
+        self.bert = BertModel.from_pretrained(bert_model_name)
+        self.bert.eval()
+        self.bert.to(device)
+
+        # 实体索引到名称的映射（通过entities.txt的索引查找）
+        self.entity_idx2name = {}
+
+        # 实体嵌入缓存 (entity_idx -> embedding tensor)
+        self.embedding_cache = {}
+
+        # 无名称实体的默认嵌入（特殊标记 [ENTITY]）
+        with torch.no_grad():
+            inputs = self.tokenizer("[ENTITY]", return_tensors="pt", padding=True, truncation=True, max_length=32)
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            outputs = self.bert(**inputs)
+            self.default_embedding = outputs.last_hidden_state[:, 0, :].cpu().squeeze(0)  # [CLS] token
+
+    def build_index_mapping(self, entities_path: str):
+        """构建实体索引到ID的映射，然后关联到名称"""
+        print(f"Building entity index mapping from {entities_path}...")
+        entity_id_to_idx = {}
+        with open(entities_path, 'r', encoding='utf-8') as f:
+            for idx, line in enumerate(f):
+                entity_id = line.strip()
+                entity_id_to_idx[entity_id] = idx
+
+        # 构建索引到名称的映射
+        self.entity_idx2name = {}
+        for entity_id, name in self.idx2name.items():
+            if entity_id in entity_id_to_idx:
+                idx = entity_id_to_idx[entity_id]
+                self.entity_idx2name[idx] = name
+
+        print(f"Built mapping for {len(self.entity_idx2name)} entities with names")
+
+    def encode_entity(self, entity_idx: int) -> torch.Tensor:
+        """编码单个实体，使用缓存"""
+        if entity_idx in self.embedding_cache:
+            return self.embedding_cache[entity_idx]
+
+        # 获取实体名称
+        name = self.entity_idx2name.get(entity_idx)
+
+        if name is None:
+            # 没有名称的实体使用默认嵌入
+            embedding = self.default_embedding.clone()
+        else:
+            # 用BERT编码实体名称
+            with torch.no_grad():
+                inputs = self.tokenizer(
+                    name,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=64
+                )
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                outputs = self.bert(**inputs)
+                embedding = outputs.last_hidden_state[:, 0, :].cpu().squeeze(0)  # [CLS] token
+
+        # 缓存
+        self.embedding_cache[entity_idx] = embedding
+        return embedding
+
+    def encode_entities_batch(self, entity_indices: List[int]) -> torch.Tensor:
+        """批量编码多个实体"""
+        embeddings = []
+        for idx in entity_indices:
+            emb = self.encode_entity(idx)
+            embeddings.append(emb)
+        return torch.stack(embeddings)
+
+
 class GraphRAGEvaluator:
     """GraphRAG评估器"""
 
@@ -72,6 +176,17 @@ class GraphRAGEvaluator:
         self.model = self._load_model()
         self.dataset = None
         self.subgraph_processor = None
+
+        # 初始化实体名称编码器（用于BERT语义特征）
+        self.entity_name_encoder = None
+        if config.entity_names_path and os.path.exists(config.entity_names_path):
+            self.entity_name_encoder = EntityNameEncoder(
+                entity_names_path=config.entity_names_path,
+                bert_model_name=config.bert_model_path,
+                device=str(self.device)
+            )
+            # 构建索引到名称的映射
+            self.entity_name_encoder.build_index_mapping(config.entities_path)
 
     def _load_model(self):
         """加载训练好的模型"""
@@ -240,6 +355,15 @@ class GraphRAGEvaluator:
 
         # 创建反向映射：局部索引 -> 实体行号
         local2entity_idx = {v: k for k, v in entity_idx2local.items()}
+
+        # 如果使用实体名称编码器，用BERT语义特征替换随机特征
+        if self.entity_name_encoder is not None:
+            entity_list = [local2entity_idx[i] for i in range(len(local2entity_idx))]
+            node_features_list = []
+            for entity_idx in entity_list:
+                emb = self.entity_name_encoder.encode_entity(entity_idx)
+                node_features_list.append(emb)
+            node_features = torch.stack(node_features_list).to(self.device)
 
         # 构建关系映射：局部关系索引 -> 关系名称
         # 注意：edge_types 中的值是 relation2idx[r] = next_rel_idx % num_relations
@@ -554,6 +678,8 @@ def parse_args():
                         help="实体列表路径")
     parser.add_argument("--relations_path", type=str, required=True,
                         help="关系列表路径")
+    parser.add_argument("--entity_names_path", type=str, default="",
+                        help="实体名称文件路径 (entity_name.txt)，用于BERT语义编码")
 
     # 模型配置
     parser.add_argument("--checkpoint_path", type=str, required=True,
@@ -606,6 +732,7 @@ def main():
         test_original_data_path=args.test_original_data_path,
         entities_path=args.entities_path,
         relations_path=args.relations_path,
+        entity_names_path=args.entity_names_path,
         checkpoint_path=args.checkpoint_path,
         bert_model_path=args.bert_model_path,
         hidden_dim=args.hidden_dim,
