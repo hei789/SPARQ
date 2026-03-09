@@ -250,6 +250,58 @@ class GNNPathEncoder(nn.Module):
 
         return path_embedding
 
+    def forward_from_encoded(
+        self,
+        encoded_features: torch.Tensor,
+        path_nodes: List[int],
+        path_relations: List[int]
+    ) -> torch.Tensor:
+        """
+        从预编码的节点特征编码路径（跳过GNN消息传递）
+
+        Args:
+            encoded_features: 预编码的节点特征 (num_nodes, hidden_dim)
+            path_nodes: 路径上的节点索引列表
+            path_relations: 路径上的关系索引列表
+
+        Returns:
+            path_embedding: 路径的向量表示 (hidden_dim,)
+        """
+        if len(path_nodes) == 0:
+            return torch.zeros(self.hidden_dim, device=encoded_features.device)
+
+        device = encoded_features.device
+
+        # 步骤1: 提取路径上的节点特征（使用预编码特征，跳过GNN）
+        path_node_feats = encoded_features[path_nodes]  # (path_len, hidden_dim)
+
+        # 步骤2: 添加位置编码（捕捉路径顺序）
+        path_length = len(path_nodes)
+        positions = torch.arange(path_length, device=device).clamp(0, self.max_path_length - 1)
+        pos_emb = self.position_embedding(positions)  # (path_len, hidden_dim)
+        path_node_feats = path_node_feats + pos_emb
+
+        # 步骤3: 路径注意力池化
+        if self.use_path_attention and path_length > 1:
+            # 计算每个节点的注意力权重
+            attn_scores = self.path_attention(path_node_feats)  # (path_len, 1)
+            attn_weights = torch.softmax(attn_scores, dim=0)
+
+            # 加权求和
+            path_context = (path_node_feats * attn_weights).sum(dim=0)  # (hidden_dim,)
+        else:
+            # 平均池化
+            path_context = path_node_feats.mean(dim=0)  # (hidden_dim,)
+
+        # 步骤4: 计算路径的全局上下文（子图均值）
+        global_context = self.global_context(encoded_features.mean(dim=0))  # (hidden_dim,)
+
+        # 步骤5: 结合路径上下文和全局上下文
+        combined = torch.cat([path_context, global_context], dim=-1)  # (hidden_dim * 2,)
+        path_embedding = self.output_projection(combined)  # (hidden_dim,)
+
+        return path_embedding
+
 
 class RGCNLayer(nn.Module):
     """关系图卷积层"""
@@ -505,9 +557,10 @@ class GraphRetriever(nn.Module):
         beams = [(0.0, [start_node], [])]
         completed_paths = []
 
-        # 如果使用GNN路径编码器，预先生成边信息用于子图编码
+        # 如果使用GNN路径编码器，预先生成边信息并预编码子图（优化：避免重复计算）
         edge_index_for_path = None
         edge_types_for_path = None
+        encoded_features = node_features
         if self.path_encoder_type == "gnn":
             # 从邻接表重建边索引
             edge_list = []
@@ -520,6 +573,11 @@ class GraphRetriever(nn.Module):
             if edge_list:
                 edge_index_for_path = torch.tensor(edge_list, dtype=torch.long, device=device).t()
                 edge_types_for_path = torch.tensor(edge_type_list, dtype=torch.long, device=device)
+            # 预编码子图（只执行一次GNN消息传递）
+            with torch.no_grad():
+                encoded_features = self.path_encoder.encode_subgraph(
+                    node_features, edge_index_for_path, edge_types_for_path
+                )
 
         for step in range(self.max_path_length):
             candidates = []
@@ -538,9 +596,9 @@ class GraphRetriever(nn.Module):
 
                     # 编码新路径
                     if self.path_encoder_type == "gnn":
-                        path_embedding = self.path_encoder(
-                            node_features, new_path_nodes, new_path_relations,
-                            edge_index_for_path, edge_types_for_path
+                        # 使用预编码的特征，不再重复GNN计算
+                        path_embedding = self.path_encoder.forward_from_encoded(
+                            encoded_features, new_path_nodes, new_path_relations
                         )
                     else:
                         path_embedding = self.path_encoder(
@@ -585,9 +643,9 @@ class GraphRetriever(nn.Module):
         # 添加beams中剩余的路径
         for score, path_nodes, path_relations in beams:
             if self.path_encoder_type == "gnn":
-                path_embedding = self.path_encoder(
-                    node_features, path_nodes, path_relations,
-                    edge_index_for_path, edge_types_for_path
+                # 使用预编码的特征
+                path_embedding = self.path_encoder.forward_from_encoded(
+                    encoded_features, path_nodes, path_relations
                 )
             else:
                 path_embedding = self.path_encoder(
