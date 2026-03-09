@@ -92,19 +92,36 @@ class GraphRAGEvaluator:
             similarity_threshold=self.config.similarity_threshold
         )
 
+        # 修复：保存完整的 retriever，不只是 path_encoder
         model = nn.ModuleDict({
             'query_encoder': query_encoder,
-            'path_encoder': retriever.path_encoder
+            'retriever': retriever
         }).to(self.device)
 
         # 加载检查点
         checkpoint = torch.load(self.config.checkpoint_path, map_location=self.device)
 
         if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
+            state_dict = checkpoint['model_state_dict']
+
+            # 检查是否是旧版 checkpoint（只有 path_encoder）
+            if 'path_encoder' in state_dict and 'retriever' not in state_dict:
+                print("Loading legacy checkpoint (path_encoder only)...")
+                # 将旧版 path_encoder 权重迁移到新结构
+                retriever.path_encoder.load_state_dict(state_dict['path_encoder'])
+                # query_encoder 直接加载
+                if 'query_encoder' in state_dict:
+                    model['query_encoder'].load_state_dict(state_dict['query_encoder'])
+                print("Warning: GNN layers in retriever are randomly initialized!")
+                print("Please retrain the model to get the full retriever weights.")
+            else:
+                # 正常加载完整 checkpoint
+                model.load_state_dict(state_dict)
+
             print(f"Checkpoint epoch: {checkpoint.get('epoch', 'unknown')}")
             print(f"Checkpoint metrics: {checkpoint.get('metrics', 'unknown')}")
         else:
+            # 直接加载 state dict（兼容旧格式）
             model.load_state_dict(checkpoint)
             print("Loaded model state dict directly")
 
@@ -221,26 +238,17 @@ class GraphRAGEvaluator:
         num_nodes = node_features.size(0)
         all_paths = []
 
+        # 修复：直接使用加载的完整 retriever，不再创建新的
+        retriever = self.model['retriever']
+        retriever.eval()
+
         with torch.no_grad():
             for start_node in local_topic_entities:
                 if start_node >= num_nodes:
                     continue
 
-                # 使用retriever进行束搜索
-                retriever = GraphRetriever(
-                    hidden_dim=self.config.hidden_dim,
-                    num_gnn_layers=self.config.num_retriever_layers,
-                    num_relations=self.config.num_relations,
-                    beam_width=self.config.beam_width,
-                    max_path_length=self.config.max_path_length,
-                    similarity_threshold=self.config.similarity_threshold
-                ).to(self.device)
-
-                # 加载path_encoder权重
-                retriever.path_encoder.load_state_dict(self.model['path_encoder'].state_dict())
-                retriever.eval()
-
-                # 编码子图
+                # 使用训练好的 retriever 进行束搜索
+                # 编码子图（使用训练好的 GNN 层）
                 encoded_features = retriever.encode_subgraph(node_features, edge_index, edge_types)
 
                 # 束搜索

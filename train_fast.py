@@ -76,9 +76,8 @@ class FastTrainingConfig:
     cache_paths: bool = True  # 缓存采样路径
     cache_dir: str = ".cache"
 
-    # 检查点
+    # 检查点 - 只保存 latest.pt 和 best.pt，节省存储空间
     checkpoint_dir: str = "checkpoints"
-    save_every: int = 1
     eval_every: int = 1
 
     # 设备
@@ -300,18 +299,17 @@ class FastGraphRAGTrainer:
             use_bfs_gnn=True
         )
 
-        # 路径编码器
+        # 图检索器（包含 path_encoder 和 gnn_layers）
         retriever = GraphRetriever(
             hidden_dim=self.config.hidden_dim,
             num_gnn_layers=self.config.num_retriever_layers,
             num_relations=self.config.num_relations
         )
-        path_encoder = retriever.path_encoder
 
-        # 组合模型
+        # 组合模型 - 保存完整的 retriever 以便训练 GNN 层
         model = nn.ModuleDict({
             'query_encoder': query_encoder,
-            'path_encoder': path_encoder
+            'retriever': retriever  # 保存完整的 retriever，不只是 path_encoder
         })
 
         # 解冻 path_encoder，让它参与训练（修复：原来被冻结导致无法学习）
@@ -342,8 +340,8 @@ class FastGraphRAGTrainer:
         # 分层学习率
         param_groups = [
             {'params': self.model['query_encoder'].gnn.parameters(), 'lr': self.config.learning_rate},
-            # 修复：加入 path_encoder 参与训练
-            {'params': self.model['path_encoder'].parameters(), 'lr': self.config.learning_rate},
+            # 修复：加入完整的 retriever（包含 gnn_layers 和 path_encoder）参与训练
+            {'params': self.model['retriever'].parameters(), 'lr': self.config.learning_rate},
             {'params': self.model['query_encoder'].embedding_layer.parameters(), 'lr': self.config.bert_learning_rate},
         ]
 
@@ -496,7 +494,7 @@ class FastGraphRAGTrainer:
                     if -1 in local_nodes or len(local_nodes) == 0:
                         continue
                     local_rels = [r % self.config.num_relations for r in path_rels]
-                    path_emb = self.model['path_encoder'](
+                    path_emb = self.model['retriever'].path_encoder(
                         node_features, local_nodes, local_rels
                     )
                     batch_embs.append(path_emb)
@@ -626,7 +624,7 @@ class FastGraphRAGTrainer:
         }
 
     def save_checkpoint(self, epoch: int, metrics: Dict, is_best: bool = False):
-        """保存检查点"""
+        """保存检查点 - 只保留最新和最优，节省存储空间"""
         checkpoint_dir = Path(self.config.checkpoint_dir)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -644,11 +642,7 @@ class FastGraphRAGTrainer:
         latest_path = checkpoint_dir / "latest.pt"
         torch.save(checkpoint, latest_path)
 
-        # 保存每轮检查点
-        epoch_path = checkpoint_dir / f"epoch_{epoch}.pt"
-        torch.save(checkpoint, epoch_path)
-
-        # 保存最佳检查点
+        # 保存最佳检查点（只在验证 loss 更好时）
         if is_best:
             best_path = checkpoint_dir / "best.pt"
             torch.save(checkpoint, best_path)
@@ -691,10 +685,9 @@ def parse_args():
     # 检查点配置
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints",
                         help="检查点保存目录 (默认: checkpoints)")
-    parser.add_argument("--save_every", type=int, default=1,
-                        help="每多少轮保存一次检查点 (默认: 1)")
     parser.add_argument("--eval_every", type=int, default=1,
                         help="每多少轮验证一次 (默认: 1)")
+    # 注意: save_every 参数已移除，现在只保留 latest.pt 和 best.pt"
 
     # 快速测试
     parser.add_argument("--max_train_samples", type=int, default=None)
@@ -732,7 +725,6 @@ def main():
         cache_paths=args.cache_paths,
         compile_model=args.compile_model,
         checkpoint_dir=args.checkpoint_dir,
-        save_every=args.save_every,
         eval_every=args.eval_every,
         max_train_samples=args.max_train_samples,
         max_dev_samples=args.max_dev_samples
@@ -801,9 +793,8 @@ def main():
             val_metrics = train_metrics
             is_best = False
 
-        # 保存检查点
-        if epoch % config.save_every == 0:
-            trainer.save_checkpoint(epoch, val_metrics, is_best)
+        # 保存检查点 - 每轮都保存，但只保留 latest.pt 和 best.pt
+        trainer.save_checkpoint(epoch, val_metrics, is_best)
 
         elapsed = time.time() - start_time
         print(f"Time: {elapsed:.2f}s")
