@@ -514,6 +514,14 @@ class FastGraphRAGTrainer:
         def encode_paths_batch(paths_list):
             """分批编码路径"""
             all_embs = []
+
+            # GNN路径编码器优化：预计算子图编码（只执行一次GNN消息传递）
+            encoded_features = node_features
+            if self.config.path_encoder_type == "gnn" and edge_index_for_path is not None:
+                encoded_features = self.model['retriever'].path_encoder.encode_subgraph(
+                    node_features, edge_index_for_path, edge_types_for_path
+                )
+
             for i in range(0, len(paths_list), max_paths_per_batch):
                 batch_paths = paths_list[i:i + max_paths_per_batch]
                 batch_embs = []
@@ -525,9 +533,9 @@ class FastGraphRAGTrainer:
 
                     # 根据路径编码器类型选择调用方式
                     if self.config.path_encoder_type == "gnn":
-                        path_emb = self.model['retriever'].path_encoder(
-                            node_features, local_nodes, local_rels,
-                            edge_index_for_path, edge_types_for_path
+                        # 使用预编码的特征，避免重复GNN计算
+                        path_emb = self.model['retriever'].path_encoder.forward_from_encoded(
+                            encoded_features, local_nodes, local_rels
                         )
                     else:
                         path_emb = self.model['retriever'].path_encoder(

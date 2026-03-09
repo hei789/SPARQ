@@ -573,11 +573,12 @@ class GraphRetriever(nn.Module):
             if edge_list:
                 edge_index_for_path = torch.tensor(edge_list, dtype=torch.long, device=device).t()
                 edge_types_for_path = torch.tensor(edge_type_list, dtype=torch.long, device=device)
-            # 预编码子图（只执行一次GNN消息传递）
-            with torch.no_grad():
-                encoded_features = self.path_encoder.encode_subgraph(
-                    node_features, edge_index_for_path, edge_types_for_path
-                )
+                # 预编码子图（只执行一次GNN消息传递）
+                with torch.no_grad():
+                    encoded_features = self.path_encoder.encode_subgraph(
+                        node_features, edge_index_for_path, edge_types_for_path
+                    )
+            # 如果没有边，encoded_features保持为原始的node_features
 
         for step in range(self.max_path_length):
             candidates = []
