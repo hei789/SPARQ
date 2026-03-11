@@ -14,11 +14,12 @@ python SPARQ/train_fast.py \
       --bert_model_path /root/autodl-tmp/bert-base-uncased \
       --checkpoint_dir "/root/autodl-tmp/checkpoints/CWQ" \
       --path_encoder_type gnn \
-      --path_encoder_layers 2 \
-      --epochs 30 \
-      --batch_size 8 \
-      --gradient_accumulation_steps 8 \
+      --path_encoder_layers 1 \
+      --epochs 5 \
+      --batch_size 32 \
+      --gradient_accumulation_steps 2 \
       --num_negatives 2 \
       --use_amp \
       --cache_paths \
       --num_relations 100
+

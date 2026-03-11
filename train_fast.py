@@ -350,9 +350,15 @@ class FastGraphRAGTrainer:
         self.device = torch.device(config.device)
 
         # 初始化模型
-        self.model = self._init_model()
+        self._raw_model = self._init_model()  # 保存原始模型（未compile的）
+        self.model = self._raw_model
         self.optimizer = self._init_optimizer()
         self.scaler = GradScaler(enabled=config.use_amp)
+
+        # PyTorch 2.0 compile（在优化器初始化后进行，避免OptimizedModule的问题）
+        if self.config.compile_model and hasattr(torch, 'compile'):
+            print("Using torch.compile for acceleration")
+            self.model = torch.compile(self._raw_model)
 
         # 路径采样器
         self.path_sampler = CachedPathSampler(config)
@@ -428,10 +434,14 @@ class FastGraphRAGTrainer:
         )
 
         # 组合模型 - 保存完整的 retriever 以便训练 GNN 层
-        model = nn.ModuleDict({
-            'query_encoder': query_encoder,
-            'retriever': retriever  # 保存完整的 retriever，不只是 path_encoder
-        })
+        # 使用普通 Module 而不是 ModuleDict，以便兼容 torch.compile
+        class GraphRAGModel(nn.Module):
+            def __init__(self, query_encoder, retriever):
+                super().__init__()
+                self.query_encoder = query_encoder
+                self.retriever = retriever
+
+        model = GraphRAGModel(query_encoder, retriever)
 
         # 解冻 path_encoder，让它参与训练（修复：原来被冻结导致无法学习）
         # for param in path_encoder.parameters():
@@ -443,12 +453,7 @@ class FastGraphRAGTrainer:
 
         model = model.to(self.device)
 
-        # PyTorch 2.0 compile（如果可用）
-        if self.config.compile_model and hasattr(torch, 'compile'):
-            print("Using torch.compile for acceleration")
-            model = torch.compile(model)
-
-        # 统计参数量
+        # 统计参数量（在compile前统计，避免OptimizedModule的问题）
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Total parameters: {total_params:,}")
@@ -458,12 +463,15 @@ class FastGraphRAGTrainer:
 
     def _init_optimizer(self):
         """初始化优化器（训练 query_encoder 和 path_encoder）"""
+        # 使用原始模型（未 compile 的）来访问子模块
+        model = self._raw_model
+
         # 分层学习率
         param_groups = [
-            {'params': self.model['query_encoder'].gnn.parameters(), 'lr': self.config.learning_rate},
+            {'params': model.query_encoder.gnn.parameters(), 'lr': self.config.learning_rate},
             # 修复：加入完整的 retriever（包含 gnn_layers 和 path_encoder）参与训练
-            {'params': self.model['retriever'].parameters(), 'lr': self.config.learning_rate},
-            {'params': self.model['query_encoder'].embedding_layer.parameters(), 'lr': self.config.bert_learning_rate},
+            {'params': model.retriever.parameters(), 'lr': self.config.learning_rate},
+            {'params': model.query_encoder.embedding_layer.parameters(), 'lr': self.config.bert_learning_rate},
         ]
 
         optimizer = torch.optim.AdamW(param_groups, weight_decay=self.config.weight_decay)
@@ -621,8 +629,8 @@ class FastGraphRAGTrainer:
                 edge_index_for_path = torch.tensor(edges, dtype=torch.long, device=self.device).t()
                 edge_types_for_path = torch.tensor(edge_types, dtype=torch.long, device=self.device)
 
-        # 编码查询（需要梯度）
-        query_result = self.model['query_encoder'](
+        # 编码查询（需要梯度）- 使用原始模型访问子模块
+        query_result = self._raw_model.query_encoder(
             sample['triples'],
             return_all_node_features=True
         )
@@ -642,7 +650,7 @@ class FastGraphRAGTrainer:
             # GNN路径编码器优化：预计算子图编码（只执行一次GNN消息传递）
             encoded_features = node_features
             if self.config.path_encoder_type == "gnn" and edge_index_for_path is not None:
-                encoded_features = self.model['retriever'].path_encoder.encode_subgraph(
+                encoded_features = self._raw_model.retriever.path_encoder.encode_subgraph(
                     node_features, edge_index_for_path, edge_types_for_path
                 )
 
@@ -658,11 +666,11 @@ class FastGraphRAGTrainer:
                     # 根据路径编码器类型选择调用方式
                     if self.config.path_encoder_type == "gnn":
                         # 使用预编码的特征，避免重复GNN计算
-                        path_emb = self.model['retriever'].path_encoder.forward_from_encoded(
+                        path_emb = self._raw_model.retriever.path_encoder.forward_from_encoded(
                             encoded_features, local_nodes, local_rels
                         )
                     else:
-                        path_emb = self.model['retriever'].path_encoder(
+                        path_emb = self._raw_model.retriever.path_encoder(
                             node_features, local_nodes, local_rels
                         )
                     batch_embs.append(path_emb)
