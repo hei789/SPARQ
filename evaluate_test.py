@@ -38,10 +38,14 @@ class EvalConfig:
     test_original_data_path: str
     entities_path: str
     relations_path: str
-    entity_names_path: str = ""  # 实体名称文件路径，用于BERT语义编码
 
     # 模型配置
     checkpoint_path: str
+
+    # 可选路径配置
+    entity_names_path: str = ""  # 实体名称文件路径，用于BERT语义编码
+
+    # 其他模型配置（带默认值）
     bert_model_path: str = "bert-base-uncased"
     hidden_dim: int = 768
     num_query_layers: int = 3

@@ -55,7 +55,7 @@ class FastTrainingConfig:
 
     # 训练配置
     epochs: int = 10
-    batch_size: int = 16  # 增大batch size配合梯度累积
+    batch_size: int = 48  # 增大batch size配合梯度累积（显存允许范围内尽可能大）
     learning_rate: float = 5e-4  # GNN用较大学习率
     bert_learning_rate: float = 2e-5
     weight_decay: float = 1e-5
@@ -63,27 +63,27 @@ class FastTrainingConfig:
     warmup_steps: int = 100
 
     # 路径采样配置
-    num_negatives: int = 3  # 减少负样本数加速
+    num_negatives: int = 2  # 减少负样本数加速（原3->2）
     hard_negative_ratio: float = 0.5  # 硬负样本比例
     max_path_length: int = 3
-    max_paths_per_sample: int = 5  # 限制每样本路径数
+    max_paths_per_sample: int = 3  # 限制每样本路径数（原5->3）
 
     # 路径编码器配置
     path_encoder_type: str = "gnn"  # "lstm" 或 "gnn"
-    path_encoder_layers: int = 2  # GNN路径编码器的层数
+    path_encoder_layers: int = 1  # GNN路径编码器的层数（原2->1，加速且减少过拟合）
 
     # 速度优化配置
     use_amp: bool = True  # 混合精度训练，加速2-3倍
     num_workers: int = 0  # DataLoader进程数，0表示主进程（避免BERT序列化问题）
     prefetch_factor: int = 2
-    gradient_accumulation_steps: int = 4  # 梯度累积，模拟大batch
-    compile_model: bool = False  # PyTorch 2.0 compile（如果可用）
+    gradient_accumulation_steps: int = 2  # 梯度累积（原4->2，配合更大的batch_size）
+    compile_model: bool = True  # PyTorch 2.0 compile（如果可用，显著加速）
     cache_paths: bool = True  # 缓存采样路径
     cache_dir: str = ".cache"
 
     # 检查点 - 只保存 latest.pt 和 best.pt，节省存储空间
     checkpoint_dir: str = "checkpoints"
-    eval_every: int = 1
+    eval_every: int = 2  # 每2轮验证一次（减少验证开销）
 
     # 设备
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -841,29 +841,37 @@ def parse_args():
 
     # 训练配置
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=48,
+                        help="批次大小 (默认: 48，可根据显存调整)")
     parser.add_argument("--learning_rate", type=float, default=5e-4)
     parser.add_argument("--bert_learning_rate", type=float, default=2e-5)
-    parser.add_argument("--num_negatives", type=int, default=3)
+    parser.add_argument("--num_negatives", type=int, default=2,
+                        help="每个正样本对应的负样本数 (默认: 2)")
 
     # 速度优化
     parser.add_argument("--use_amp", action="store_true", default=True)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=2,
+                        help="梯度累积步数 (默认: 2)")
     parser.add_argument("--cache_paths", action="store_true", default=True)
-    parser.add_argument("--compile_model", action="store_true", default=False)
+    parser.add_argument("--compile_model", action="store_true", default=True,
+                        help="使用torch.compile加速 (PyTorch 2.0+)")
 
     # 路径编码器配置
     parser.add_argument("--path_encoder_type", type=str, default="gnn",
                         choices=["lstm", "gnn"],
                         help="路径编码器类型: lstm 或 gnn (默认: gnn)")
-    parser.add_argument("--path_encoder_layers", type=int, default=2,
-                        help="GNN路径编码器的层数 (默认: 2)")
+    parser.add_argument("--path_encoder_layers", type=int, default=1,
+                        help="GNN路径编码器层数 (默认: 1，降低可加速训练)")
+
+    # 路径采样配置
+    parser.add_argument("--max_paths_per_sample", type=int, default=3,
+                        help="每样本最大路径数 (默认: 3)")
 
     # 检查点配置
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints",
                         help="检查点保存目录 (默认: checkpoints)")
-    parser.add_argument("--eval_every", type=int, default=1,
-                        help="每多少轮验证一次 (默认: 1)")
+    parser.add_argument("--eval_every", type=int, default=2,
+                        help="每多少轮验证一次 (默认: 2，降低可减少验证开销)")
     # 注意: save_every 参数已移除，现在只保留 latest.pt 和 best.pt
 
     # 快速测试
@@ -904,6 +912,7 @@ def main():
         compile_model=args.compile_model,
         path_encoder_type=args.path_encoder_type,
         path_encoder_layers=args.path_encoder_layers,
+        max_paths_per_sample=args.max_paths_per_sample,
         checkpoint_dir=args.checkpoint_dir,
         eval_every=args.eval_every,
         max_train_samples=args.max_train_samples,
@@ -914,10 +923,16 @@ def main():
     print("GraphRAG Fast Training")
     print("=" * 80)
     print(f"Device: {config.device}")
-    print(f"AMP: {config.use_amp}")
+    print(f"Batch Size: {config.batch_size}")
     print(f"Gradient Accumulation: {config.gradient_accumulation_steps}")
+    print(f"Effective Batch Size: {config.batch_size * config.gradient_accumulation_steps}")
+    print(f"AMP: {config.use_amp}")
+    print(f"Torch Compile: {config.compile_model}")
     print(f"Path Cache: {config.cache_paths}")
     print(f"Path Encoder: {config.path_encoder_type.upper()} (layers={config.path_encoder_layers})")
+    print(f"Max Paths Per Sample: {config.max_paths_per_sample}")
+    print(f"Num Negatives: {config.num_negatives}")
+    print(f"Eval Every: {config.eval_every} epochs")
     print(f"Checkpoint Dir: {config.checkpoint_dir}")
 
     # 创建训练器
