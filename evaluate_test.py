@@ -239,6 +239,23 @@ class GraphRAGEvaluator:
         if 'model_state_dict' in checkpoint:
             state_dict = checkpoint['model_state_dict']
 
+            # 处理 torch.compile 导致的前缀问题
+            # 移除 _orig_mod. 前缀（如果有的话）
+            processed_state_dict = {}
+            has_orig_mod_prefix = False
+            for key, value in state_dict.items():
+                if key.startswith('_orig_mod.'):
+                    new_key = key[len('_orig_mod.'):]  # 移除 _orig_mod. 前缀
+                    processed_state_dict[new_key] = value
+                    has_orig_mod_prefix = True
+                else:
+                    processed_state_dict[key] = value
+
+            if has_orig_mod_prefix:
+                print("Detected torch.compile checkpoint, removed _orig_mod. prefix")
+
+            state_dict = processed_state_dict
+
             # 检查是否是旧版 checkpoint（只有 path_encoder）
             if 'path_encoder' in state_dict and 'retriever' not in state_dict:
                 print("Loading legacy checkpoint (path_encoder only)...")
